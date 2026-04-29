@@ -199,6 +199,48 @@ pub enum StorageMode {
     Cas,
 }
 
+/// Supported archive formats for packet transport and ingestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchiveFormat {
+    /// ExtOS Native compressed archive (.pkt.tar.xz)
+    PktTarXz,
+    /// Arch Linux package (.pkg.tar.zst)
+    ArchZst,
+    /// Debian package (.deb)
+    Deb,
+    /// Alpine Linux package (.apk)
+    Apk,
+    /// Raw uncompressed tar
+    Tar,
+}
+
+impl fmt::Display for ArchiveFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArchiveFormat::PktTarXz => write!(f, "pkt.tar.xz"),
+            ArchiveFormat::ArchZst => write!(f, "pkg.tar.zst"),
+            ArchiveFormat::Deb => write!(f, "deb"),
+            ArchiveFormat::Apk => write!(f, "apk"),
+            ArchiveFormat::Tar => write!(f, "tar"),
+        }
+    }
+}
+
+impl FromStr for ArchiveFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pkt.tar.xz" => Ok(ArchiveFormat::PktTarXz),
+            "pkg.tar.zst" | "zst" => Ok(ArchiveFormat::ArchZst),
+            "deb" => Ok(ArchiveFormat::Deb),
+            "apk" => Ok(ArchiveFormat::Apk),
+            "tar" => Ok(ArchiveFormat::Tar),
+            other => Err(format!("unknown archive format: '{other}'")),
+        }
+    }
+}
+
 /// Hash algorithm used for CAS addressing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HashAlgorithm {
@@ -299,6 +341,22 @@ mod tests {
             PackageFormat::ExtractedTree
         );
         assert_eq!(PackageFormat::LoopImage.to_string(), "loop-image");
+    }
+
+    #[test]
+    fn test_archive_format_roundtrip() {
+        let cases = [
+            ("pkt.tar.xz", ArchiveFormat::PktTarXz),
+            ("pkg.tar.zst", ArchiveFormat::ArchZst),
+            ("deb", ArchiveFormat::Deb),
+            ("apk", ArchiveFormat::Apk),
+            ("tar", ArchiveFormat::Tar),
+        ];
+        for (s, expected) in cases {
+            let parsed: ArchiveFormat = s.parse().unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), s);
+        }
     }
 
     #[test]

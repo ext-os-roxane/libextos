@@ -17,7 +17,9 @@ use crate::types::PackageFormat;
 pub struct PackageManifest {
     /// Core package identity
     pub identity: PackageIdentity,
-    /// Package archive/payload format
+    /// Package archive/payload format (transport)
+    pub archive: Option<crate::types::ArchiveFormat>,
+    /// Package installation format (layout in CAS)
     pub format: PackageFormat,
     /// Runtime dependencies (Tier 1/2/3)
     pub requires: Vec<DependencySpec>,
@@ -91,15 +93,25 @@ impl PackageManifest {
         let build_requires = parse_dep_list(val, "buildRequires")?;
         let suggests = parse_suggests(val)?;
         let capabilities = parse_capabilities(val)?;
+        let archive = val
+            .get_str("archive")
+            .map(|s| s.parse::<crate::types::ArchiveFormat>())
+            .transpose()
+            .map_err(|e| ExtosError::ConfigParse {
+                path: String::new(),
+                line: 0,
+                message: e,
+            })?;
 
         Ok(PackageManifest {
             identity,
+            archive,
             format,
             requires,
             suggests,
             build_requires,
             capabilities,
-            security: None, // TODO(M15): Security parsing
+            security: None,
         })
     }
 }
@@ -375,5 +387,19 @@ mod tests {
             }
             other => panic!("expected Capability::Executable, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_archive_format() {
+        let input = r#"{
+            name = "p7zip";
+            version = "17.05";
+            origin = "archlinux";
+            format = "extracted-tree";
+            archive = "pkt.tar.xz";
+        }"#;
+        let nix = parse_nix(input).unwrap();
+        let m = PackageManifest::from_nix(&nix).unwrap();
+        assert_eq!(m.archive, Some(crate::types::ArchiveFormat::PktTarXz));
     }
 }
