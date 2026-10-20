@@ -1,0 +1,277 @@
+# ExtOS PhantomDB cross-origin spoof mappings (PLAN 2.7.16)
+#
+# These mappings let a single ExtOS package emit *additional* phantom rows in
+# foreign package-manager databases, so that tools from another origin still
+# believe their own package is installed.
+#
+# Lookup key: (origin, name) — the origin of the ingested package (as written in
+# `manifest.nix`, e.g. "archlinux") and its upstream package name. A lookup
+# returns every `[[spoof]]` record whose (origin, name) matches, i.e. one
+# package may map to several rows for the same target (e.g. `glibc` → `libc6`
+# plus `libc6-dev`).
+#
+# Schema (one array-of-tables record per emitted row):
+#
+#   [[spoof]]
+#   origin        = "archlinux"      # required: origin of the *source* package
+#   name          = "glibc"          # required: upstream package name
+#   target        = "debian"         # required: one of arch|debian|alpine|void|rpm
+#   spoof_name    = "libc6"          # required: name to report in the target DB
+#   spoof_version = "2.39-0extos1"   # optional: version to report; "" = inherit
+#   extra_provides = ["libc.so.6"]   # optional: extra provides for the spoofed row
+#
+# `spoof_version = ""` (or omitting the key) means "inherit the version of the
+# ingested package". `extra_provides` are added to whatever the package already
+# advertises (library SONAMEs, aliases).
+#
+# The file is embedded into libextos at compile time (see `manifest.rs`), so it
+# is intentionally a small, dependency-free TOML subset: comments, blank lines,
+# `[[spoof]]` headers, and `key = "string"` / `key = [ "a", "b" ]` pairs.
+
+# ── glibc (Arch/Void/Nix) → Debian: runtime + headers + tools are split ──
+[[spoof]]
+origin = "archlinux"
+name = "glibc"
+target = "debian"
+spoof_name = "libc6"
+spoof_version = "2.39-0extos1"
+extra_provides = ["libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2"]
+
+[[spoof]]
+origin = "archlinux"
+name = "glibc"
+target = "debian"
+spoof_name = "libc-dev-bin"
+spoof_version = "2.39-0extos1"
+
+[[spoof]]
+origin = "archlinux"
+name = "glibc"
+target = "debian"
+spoof_name = "libc6-dev"
+spoof_version = "2.39-0extos1"
+
+[[spoof]]
+origin = "archlinux"
+name = "glibc"
+target = "debian"
+spoof_name = "libc-bin"
+spoof_version = "2.39-0extos1"
+
+# ── glibc (Arch) → RPM: glibc / glibc-devel / glibc-headers ──
+[[spoof]]
+origin = "archlinux"
+name = "glibc"
+target = "rpm"
+spoof_name = "glibc"
+spoof_version = ""
+extra_provides = ["libc.so.6"]
+
+[[spoof]]
+origin = "archlinux"
+name = "glibc"
+target = "rpm"
+spoof_name = "glibc-devel"
+spoof_version = ""
+
+[[spoof]]
+origin = "archlinux"
+name = "glibc"
+target = "rpm"
+spoof_name = "glibc-headers"
+spoof_version = ""
+
+# ── glibc (Arch) → Alpine: musl-compatible libc rows ──
+[[spoof]]
+origin = "archlinux"
+name = "glibc"
+target = "alpine"
+spoof_name = "musl"
+spoof_version = ""
+extra_provides = ["libc.so.6"]
+
+[[spoof]]
+origin = "archlinux"
+name = "glibc"
+target = "alpine"
+spoof_name = "musl-dev"
+spoof_version = ""
+
+# ── Debian libc6 → Arch glibc ──
+[[spoof]]
+origin = "debian"
+name = "libc6"
+target = "arch"
+spoof_name = "glibc"
+spoof_version = ""
+extra_provides = ["libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2"]
+
+# ── Debian libc6 → Alpine musl ──
+[[spoof]]
+origin = "debian"
+name = "libc6"
+target = "alpine"
+spoof_name = "musl"
+spoof_version = ""
+
+# ── Debian libc6 → RPM glibc ──
+[[spoof]]
+origin = "debian"
+name = "libc6"
+target = "rpm"
+spoof_name = "glibc"
+spoof_version = ""
+
+# ── musl (Alpine) → glibc rows for glibc-origin roofs ──
+[[spoof]]
+origin = "alpine"
+name = "musl"
+target = "arch"
+spoof_name = "glibc"
+spoof_version = ""
+extra_provides = ["libc.musl-x86_64.so.1"]
+
+[[spoof]]
+origin = "alpine"
+name = "musl"
+target = "debian"
+spoof_name = "libc6"
+spoof_version = ""
+extra_provides = ["libc.musl-x86_64.so.1"]
+
+# ── musl-dev (Alpine) → glibc headers ──
+[[spoof]]
+origin = "alpine"
+name = "musl-dev"
+target = "arch"
+spoof_name = "glibc"
+spoof_version = ""
+
+[[spoof]]
+origin = "alpine"
+name = "musl-dev"
+target = "debian"
+spoof_name = "libc6-dev"
+spoof_version = ""
+
+# ── OpenSSL: Debian libssl3 ↔ Arch openssl ↔ RPM openssl-libs ──
+[[spoof]]
+origin = "debian"
+name = "libssl3"
+target = "arch"
+spoof_name = "openssl"
+spoof_version = ""
+extra_provides = ["libssl.so.3", "libcrypto.so.3"]
+
+[[spoof]]
+origin = "archlinux"
+name = "openssl"
+target = "debian"
+spoof_name = "libssl3"
+spoof_version = ""
+extra_provides = ["libssl.so.3", "libcrypto.so.3"]
+
+[[spoof]]
+origin = "archlinux"
+name = "openssl"
+target = "rpm"
+spoof_name = "openssl-libs"
+spoof_version = ""
+extra_provides = ["libssl.so.3", "libcrypto.so.3"]
+
+[[spoof]]
+origin = "rpm"
+name = "openssl-libs"
+target = "debian"
+spoof_name = "libssl3"
+spoof_version = ""
+extra_provides = ["libssl.so.3", "libcrypto.so.3"]
+
+[[spoof]]
+origin = "rpm"
+name = "openssl-libs"
+target = "arch"
+spoof_name = "openssl"
+spoof_version = ""
+
+# ── Kernel: Arch linux ↔ Debian linux-image-* ↔ RPM kernel-core ──
+[[spoof]]
+origin = "archlinux"
+name = "linux"
+target = "debian"
+spoof_name = "linux-image-extos"
+spoof_version = ""
+
+[[spoof]]
+origin = "archlinux"
+name = "linux"
+target = "debian"
+spoof_name = "linux-headers-extos"
+spoof_version = ""
+
+[[spoof]]
+origin = "archlinux"
+name = "linux"
+target = "rpm"
+spoof_name = "kernel-core"
+spoof_version = ""
+
+[[spoof]]
+origin = "debian"
+name = "linux-image"
+target = "arch"
+spoof_name = "linux"
+spoof_version = ""
+
+[[spoof]]
+origin = "debian"
+name = "linux-image"
+target = "rpm"
+spoof_name = "kernel-core"
+spoof_version = ""
+
+[[spoof]]
+origin = "rpm"
+name = "kernel-core"
+target = "arch"
+spoof_name = "linux"
+spoof_version = ""
+
+# ── CA certificates: same trust store, different package names ──
+[[spoof]]
+origin = "debian"
+name = "ca-certificates"
+target = "arch"
+spoof_name = "ca-certificates"
+spoof_version = ""
+
+[[spoof]]
+origin = "archlinux"
+name = "ca-certificates"
+target = "debian"
+spoof_name = "ca-certificates"
+spoof_version = ""
+
+[[spoof]]
+origin = "archlinux"
+name = "ca-certificates"
+target = "rpm"
+spoof_name = "ca-certificates"
+spoof_version = ""
+
+# ── zlib ──
+[[spoof]]
+origin = "debian"
+name = "zlib1g"
+target = "arch"
+spoof_name = "zlib"
+spoof_version = ""
+extra_provides = ["libz.so.1"]
+
+[[spoof]]
+origin = "archlinux"
+name = "zlib"
+target = "debian"
+spoof_name = "zlib1g"
+spoof_version = ""
+extra_provides = ["libz.so.1"]

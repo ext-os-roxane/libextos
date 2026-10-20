@@ -3,7 +3,10 @@
 //! Represents the ExtOS `manifest.nix` stored at
 //! `/repository/objects/<hash>/metadata/manifest.nix`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::str::FromStr;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +14,13 @@ use crate::config::NixValue;
 use crate::dependency::{CapabilityRequest, DependencySpec};
 use crate::error::ExtosError;
 use crate::types::PackageFormat;
+
+/// The well-known cross-origin spoof mapping table, embedded at compile time.
+///
+/// See `data/spoof_mappings.toml` for the schema. Used by
+/// [`resolve_auto_spoofs`] as a fallback when a manifest does not declare
+/// explicit [`PackageManifest::phantom_spoofs`].
+pub const SPOOF_MAPPINGS_TOML: &str = include_str!("../data/spoof_mappings.toml");
 
 /// A fully parsed ExtOS package manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +41,129 @@ pub struct PackageManifest {
     pub capabilities: Capabilities,
     /// Security declarations (file capabilities, MAC profiles)
     pub security: Option<SecurityBlock>,
+    /// Additional phantom rows this package emits for foreign package managers
+    /// (PhantomDB row spoofing, PLAN 2.7). Empty by default; older manifests
+    /// that predate the field deserialize to an empty map.
+    #[serde(default)]
+    pub phantom_spoofs: BTreeMap<SpoofTarget, Vec<SpoofEntry>>,
+}
+
+/// A foreign package-manager database that a package can spoof rows into.
+///
+/// The canonical spelling (see [`SpoofTarget::as_str`]) doubles as the key used
+/// in the `phantom_spoofs` Nix table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpoofTarget {
+    /// Arch Linux / pacman (`/var/lib/pacman/local`).
+    Arch,
+    /// Debian / dpkg (`/var/lib/dpkg/status`).
+    Debian,
+    /// Alpine / apk (`/lib/apk/db/installed`).
+    Alpine,
+    /// Void Linux / xbps (`/var/db/xbps`).
+    Void,
+    /// RPM-based distributions (`/var/lib/rpm`).
+    Rpm,
+}
+
+impl SpoofTarget {
+    /// All supported targets, in canonical order.
+    pub const ALL: [SpoofTarget; 5] = [
+        SpoofTarget::Arch,
+        SpoofTarget::Debian,
+        SpoofTarget::Alpine,
+        SpoofTarget::Void,
+        SpoofTarget::Rpm,
+    ];
+
+    /// The canonical key for this target (`"arch"`, `"debian"`, …).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SpoofTarget::Arch => "arch",
+            SpoofTarget::Debian => "debian",
+            SpoofTarget::Alpine => "alpine",
+            SpoofTarget::Void => "void",
+            SpoofTarget::Rpm => "rpm",
+        }
+    }
+
+    /// The canonical `manifest.identity.origin` value for this target.
+    pub fn canonical_origin(&self) -> &'static str {
+        match self {
+            SpoofTarget::Arch => "archlinux",
+            SpoofTarget::Debian => "debian",
+            SpoofTarget::Alpine => "alpine",
+            SpoofTarget::Void => "void",
+            SpoofTarget::Rpm => "rpm",
+        }
+    }
+
+    /// Map a manifest origin (`"archlinux"`, `"dpkg"`, `"fedora"`, …) to a target.
+    ///
+    /// Returns `None` for origins that have no phantom database (Nix, pypi,
+    /// android, …).
+    pub fn from_origin(origin: &str) -> Option<Self> {
+        match origin.to_ascii_lowercase().as_str() {
+            "archlinux" | "arch" | "pacman" => Some(SpoofTarget::Arch),
+            "debian" | "ubuntu" | "dpkg" | "apt" => Some(SpoofTarget::Debian),
+            "alpine" | "apk" => Some(SpoofTarget::Alpine),
+            "void" | "xbps" => Some(SpoofTarget::Void),
+            "rpm" | "fedora" | "suse" | "rhel" | "centos" | "dnf" | "yum" | "zypper" => {
+                Some(SpoofTarget::Rpm)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for SpoofTarget {
+    type Err = ExtosError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_origin(s).ok_or_else(|| ExtosError::ConfigParse {
+            path: String::new(),
+            line: 0,
+            message: format!("unknown phantom spoof target: {s}"),
+        })
+    }
+}
+
+impl fmt::Display for SpoofTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One spoofed phantom row: the name/version a foreign package manager should
+/// see, plus any extra capability strings that row should advertise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpoofEntry {
+    /// Package name in the target package manager's namespace.
+    pub name: String,
+    /// Version to report; empty means "inherit the ingested package version".
+    #[serde(default)]
+    pub version: String,
+    /// Extra `Provides`-style strings for the spoofed row (e.g. `libc.so.6`).
+    #[serde(default)]
+    pub extra_provides: Vec<String>,
+}
+
+impl SpoofEntry {
+    /// Construct a spoof entry with no extra provides.
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            extra_provides: Vec::new(),
+        }
+    }
+
+    /// Attach extra provides to this entry.
+    pub fn with_extra_provides(mut self, provides: impl IntoIterator<Item = String>) -> Self {
+        self.extra_provides.extend(provides);
+        self
+    }
 }
 
 /// The identity block — who this package is and what it replaces.
@@ -93,6 +226,7 @@ impl PackageManifest {
         let build_requires = parse_dep_list(val, "buildRequires")?;
         let suggests = parse_suggests(val)?;
         let capabilities = parse_capabilities(val)?;
+        let phantom_spoofs = parse_phantom_spoofs(val)?;
         let archive = val
             .get_str("archive")
             .map(|s| s.parse::<crate::types::ArchiveFormat>())
@@ -112,7 +246,42 @@ impl PackageManifest {
             build_requires,
             capabilities,
             security: None,
+            phantom_spoofs,
         })
+    }
+
+    /// Render the `phantom_spoofs` block as `manifest.nix`-compatible text.
+    ///
+    /// Returns `None` when the package declares no spoofs, so callers can omit
+    /// the block entirely and stay byte-compatible with older manifests.
+    pub fn phantom_spoofs_nix(&self) -> Option<String> {
+        render_phantom_spoofs_nix(&self.phantom_spoofs)
+    }
+
+    /// The spoof rows to emit for `target`.
+    ///
+    /// Explicit manifest declarations win; when the manifest has none at all
+    /// (for any target) the well-known mapping table is consulted as a fallback
+    /// (PLAN 2.7.17). Entries with an empty version inherit the package version.
+    pub fn effective_spoofs_for(&self, target: SpoofTarget) -> Vec<SpoofEntry> {
+        let explicit = self.phantom_spoofs.get(&target);
+        let mut entries: Vec<SpoofEntry> = match explicit {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ if self.phantom_spoofs.is_empty() => {
+                resolve_auto_spoofs(&self.identity.origin, &self.identity.name)
+                    .into_iter()
+                    .filter(|(t, _)| *t == target)
+                    .map(|(_, e)| e)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        for entry in &mut entries {
+            if entry.version.is_empty() {
+                entry.version.clone_from(&self.identity.version);
+            }
+        }
+        entries
     }
 }
 
@@ -274,6 +443,316 @@ fn parse_capabilities(val: &NixValue) -> Result<Capabilities, ExtosError> {
     })
 }
 
+// ─── Phantom spoofs (PLAN 2.7) ──────────────────────────────────
+
+/// Parse `phantom_spoofs = { <target> = [ { name; version; extra_provides } ]; }`.
+fn parse_phantom_spoofs(
+    val: &NixValue,
+) -> Result<BTreeMap<SpoofTarget, Vec<SpoofEntry>>, ExtosError> {
+    let mut out = BTreeMap::new();
+    let root = match val.get_path("phantom_spoofs") {
+        Some(v) => v,
+        None => return Ok(out),
+    };
+    let table = root.as_attrset().ok_or_else(|| ExtosError::ConfigParse {
+        path: String::new(),
+        line: 0,
+        message: "manifest field 'phantom_spoofs' must be an attribute set".into(),
+    })?;
+
+    for (key, entries_val) in table {
+        let target: SpoofTarget = key.parse()?;
+        let list = entries_val.as_list().ok_or_else(|| ExtosError::ConfigParse {
+            path: String::new(),
+            line: 0,
+            message: format!("phantom_spoofs.{key} must be a list"),
+        })?;
+
+        let mut entries = Vec::with_capacity(list.len());
+        for item in list {
+            let name = item
+                .get_str("name")
+                .ok_or_else(|| ExtosError::ConfigParse {
+                    path: String::new(),
+                    line: 0,
+                    message: format!("phantom_spoofs.{key} entry missing 'name'"),
+                })?
+                .to_string();
+            let version = item
+                .get_str("version")
+                .unwrap_or_default()
+                .to_string();
+            let mut extra_provides: Vec<String> = item
+                .get_str_list("extra_provides")
+                .or_else(|| item.get_str_list("provides"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            extra_provides.dedup();
+            entries.push(SpoofEntry {
+                name,
+                version,
+                extra_provides,
+            });
+        }
+        out.insert(target, entries);
+    }
+
+    Ok(out)
+}
+
+/// Render a spoof map as `manifest.nix` text (empty map → `None`).
+fn render_phantom_spoofs_nix(spoofs: &BTreeMap<SpoofTarget, Vec<SpoofEntry>>) -> Option<String> {
+    let mut non_empty = spoofs.iter().filter(|(_, entries)| !entries.is_empty()).peekable();
+    non_empty.peek()?;
+
+    let mut out = String::from("phantom_spoofs = {\n");
+    for (target, entries) in non_empty {
+        out.push_str(&format!("  {} = [\n", target.as_str()));
+        for entry in entries {
+            out.push_str(&format!("    {{ name = {}; version = {};", quote(entry.name.as_str()), quote(entry.version.as_str())));
+            if !entry.extra_provides.is_empty() {
+                let list = entry
+                    .extra_provides
+                    .iter()
+                    .map(|p| quote(p.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push_str(&format!(" extra_provides = [ {list} ];"));
+            }
+            out.push_str(" }\n");
+        }
+        out.push_str("  ];\n");
+    }
+    out.push_str("};\n");
+    Some(out)
+}
+
+/// Quote a string for Nix output.
+fn quote(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// One row of the embedded spoof mapping table.
+#[derive(Debug, Clone)]
+struct MappingRecord {
+    origin: String,
+    name: String,
+    target: SpoofTarget,
+    entry: SpoofEntry,
+}
+
+#[derive(Debug, Default)]
+struct MappingBuilder {
+    origin: Option<String>,
+    name: Option<String>,
+    target: Option<String>,
+    spoof_name: Option<String>,
+    spoof_version: Option<String>,
+    extra_provides: Vec<String>,
+}
+
+impl MappingBuilder {
+    fn finish(self, line: usize) -> Result<MappingRecord, ExtosError> {
+        let origin = self.origin.ok_or_else(|| mapping_err(line, "missing 'origin'"))?;
+        let name = self.name.ok_or_else(|| mapping_err(line, "missing 'name'"))?;
+        let target_raw = self
+            .target
+            .ok_or_else(|| mapping_err(line, "missing 'target'"))?;
+        let target: SpoofTarget = target_raw.parse().map_err(|_| {
+            mapping_err(line, &format!("unknown 'target' value: {target_raw}"))
+        })?;
+        let spoof_name = self
+            .spoof_name
+            .ok_or_else(|| mapping_err(line, "missing 'spoof_name'"))?;
+        Ok(MappingRecord {
+            origin,
+            name,
+            target,
+            entry: SpoofEntry {
+                name: spoof_name,
+                version: self.spoof_version.unwrap_or_default(),
+                extra_provides: self.extra_provides,
+            },
+        })
+    }
+}
+
+fn mapping_err(line: usize, message: &str) -> ExtosError {
+    ExtosError::ConfigParse {
+        path: "data/spoof_mappings.toml".into(),
+        line: line + 1,
+        message: message.into(),
+    }
+}
+
+/// Parse the embedded, intentionally-minimal TOML subset used by
+/// `data/spoof_mappings.toml`.
+fn parse_spoof_mappings(text: &str) -> Result<Vec<MappingRecord>, ExtosError> {
+    let mut out = Vec::new();
+    let mut current: Option<MappingBuilder> = None;
+
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if line != "[[spoof]]" {
+                return Err(mapping_err(idx, &format!("unsupported table header: {line}")));
+            }
+            if let Some(builder) = current.take() {
+                out.push(builder.finish(idx)?);
+            }
+            current = Some(MappingBuilder::default());
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| mapping_err(idx, &format!("expected key = value, got: {line}")))?;
+        let builder = current
+            .as_mut()
+            .ok_or_else(|| mapping_err(idx, "key/value pair outside a [[spoof]] table"))?;
+
+        match key.trim() {
+            "origin" => builder.origin = Some(parse_toml_string(value, idx)?),
+            "name" => builder.name = Some(parse_toml_string(value, idx)?),
+            "target" => builder.target = Some(parse_toml_string(value, idx)?),
+            "spoof_name" => builder.spoof_name = Some(parse_toml_string(value, idx)?),
+            "spoof_version" => builder.spoof_version = Some(parse_toml_string(value, idx)?),
+            "extra_provides" => builder.extra_provides = parse_toml_string_list(value, idx)?,
+            other => {
+                return Err(mapping_err(idx, &format!("unknown key: {other}")));
+            }
+        }
+    }
+
+    if let Some(builder) = current {
+        out.push(builder.finish(text.lines().count())?);
+    }
+    Ok(out)
+}
+
+/// Parse a quoted single-line TOML string with `\\` and `\"` escapes.
+fn parse_toml_string(value: &str, line: usize) -> Result<String, ExtosError> {
+    let v = value.trim();
+    let inner = v
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(|| mapping_err(line, &format!("expected a quoted string, got: {v}")))?;
+
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                return Err(mapping_err(line, &format!("unsupported escape: \\{other}")));
+            }
+            None => return Err(mapping_err(line, "dangling escape")),
+        }
+    }
+    Ok(out)
+}
+
+/// Parse `[ "a", "b" ]`.
+fn parse_toml_string_list(value: &str, line: usize) -> Result<Vec<String>, ExtosError> {
+    let v = value.trim();
+    let inner = v
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| mapping_err(line, &format!("expected a string list, got: {v}")))?;
+
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if !in_string => in_string = true,
+            '"' if in_string => {
+                in_string = false;
+                items.push(std::mem::take(&mut current));
+            }
+            '\\' if in_string => match chars.next() {
+                Some('"') => current.push('"'),
+                Some('\\') => current.push('\\'),
+                Some(other) => {
+                    return Err(mapping_err(line, &format!("unsupported escape: \\{other}")));
+                }
+                None => return Err(mapping_err(line, "dangling escape")),
+            },
+            ',' if !in_string => {}
+            c if in_string => current.push(c),
+            c if c.is_whitespace() => {}
+            other => {
+                return Err(mapping_err(
+                    line,
+                    &format!("unexpected character in list: {other}"),
+                ));
+            }
+        }
+    }
+    if in_string {
+        return Err(mapping_err(line, "unterminated string in list"));
+    }
+    Ok(items)
+}
+
+/// The parsed, embedded mapping table (parsed once per process).
+fn spoof_mapping_table() -> &'static [MappingRecord] {
+    static TABLE: OnceLock<Vec<MappingRecord>> = OnceLock::new();
+    TABLE.get_or_init(|| match parse_spoof_mappings(SPOOF_MAPPINGS_TOML) {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::warn!("embedded spoof mapping table is invalid: {e}");
+            Vec::new()
+        }
+    })
+}
+
+/// Normalized origin key, so `"arch"`/`"pacman"` match `"archlinux"`.
+fn canonical_origin_key(origin: &str) -> String {
+    SpoofTarget::from_origin(origin)
+        .map(|t| t.canonical_origin().to_string())
+        .unwrap_or_else(|| origin.to_ascii_lowercase())
+}
+
+/// Look up automatic spoof rows for an ingested package (PLAN 2.7.17).
+///
+/// Consulted only when a manifest declares no explicit
+/// [`PackageManifest::phantom_spoofs`]. Matching is by normalized origin and
+/// exact upstream name. Entries may carry an empty version, meaning "inherit
+/// the package version" — [`PackageManifest::effective_spoofs_for`] resolves it.
+///
+/// # Examples
+///
+/// ```
+/// use libextos::manifest::resolve_auto_spoofs;
+///
+/// let rows = resolve_auto_spoofs("archlinux", "glibc");
+/// assert!(rows.iter().any(|(target, entry)| {
+///     target.as_str() == "debian" && entry.name == "libc6"
+/// }));
+/// ```
+pub fn resolve_auto_spoofs(origin: &str, name: &str) -> Vec<(SpoofTarget, SpoofEntry)> {
+    let origin_key = canonical_origin_key(origin);
+    spoof_mapping_table()
+        .iter()
+        .filter(|record| {
+            record.name == name && canonical_origin_key(&record.origin) == origin_key
+        })
+        .map(|record| (record.target, record.entry.clone()))
+        .collect()
+}
+
 // ─── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -401,5 +880,174 @@ mod tests {
         let nix = parse_nix(input).unwrap();
         let m = PackageManifest::from_nix(&nix).unwrap();
         assert_eq!(m.archive, Some(crate::types::ArchiveFormat::PktTarXz));
+    }
+
+    #[test]
+    fn test_manifest_without_spoofs_defaults_to_empty() {
+        let input = r#"{ name = "htop"; version = "3.3.0"; origin = "archlinux"; }"#;
+        let nix = parse_nix(input).unwrap();
+        let m = PackageManifest::from_nix(&nix).unwrap();
+        assert!(m.phantom_spoofs.is_empty());
+        assert!(m.phantom_spoofs_nix().is_none());
+    }
+
+    #[test]
+    fn test_parse_phantom_spoofs() {
+        let input = r#"{
+            name = "glibc";
+            version = "2.39";
+            origin = "archlinux";
+
+            phantom_spoofs = {
+                debian = [
+                    { name = "libc6";     version = "2.39-0extos1"; }
+                    { name = "libc6-dev"; version = "2.39-0extos1"; }
+                ];
+                alpine = [
+                    { name = "musl"; version = "1.2.5-r0"; extra_provides = [ "libc.so.6" ]; }
+                ];
+            };
+        }"#;
+        let nix = parse_nix(input).unwrap();
+        let m = PackageManifest::from_nix(&nix).unwrap();
+
+        let debian = m.phantom_spoofs.get(&SpoofTarget::Debian).unwrap();
+        assert_eq!(debian.len(), 2);
+        assert_eq!(debian[0].name, "libc6");
+        assert_eq!(debian[1].name, "libc6-dev");
+
+        let alpine = m.phantom_spoofs.get(&SpoofTarget::Alpine).unwrap();
+        assert_eq!(alpine[0].extra_provides, vec!["libc.so.6"]);
+
+        assert!(!m.phantom_spoofs.contains_key(&SpoofTarget::Rpm));
+    }
+
+    #[test]
+    fn test_parse_phantom_spoofs_accepts_empty_version() {
+        let input = r#"{
+            name = "glibc";
+            version = "2.39";
+            origin = "archlinux";
+            phantom_spoofs = { rpm = [ { name = "glibc-devel"; } ]; };
+        }"#;
+        let nix = parse_nix(input).unwrap();
+        let m = PackageManifest::from_nix(&nix).unwrap();
+        let entries = m.effective_spoofs_for(SpoofTarget::Rpm);
+        assert_eq!(entries[0].version, "2.39");
+    }
+
+    #[test]
+    fn test_parse_phantom_spoofs_rejects_unknown_target() {
+        let input = r#"{
+            name = "glibc";
+            version = "2.39";
+            origin = "archlinux";
+            phantom_spoofs = { gentoo = [ { name = "glibc"; } ]; };
+        }"#;
+        let nix = parse_nix(input).unwrap();
+        let err = PackageManifest::from_nix(&nix).unwrap_err();
+        assert!(err.to_string().contains("unknown phantom spoof target"));
+    }
+
+    #[test]
+    fn test_phantom_spoofs_nix_roundtrip() {
+        let input = r#"{
+            name = "glibc";
+            version = "2.39";
+            origin = "archlinux";
+            phantom_spoofs = {
+                debian = [ { name = "libc6"; version = "2.39-0extos1"; } ];
+                void = [ { name = "glibc"; version = ""; } ];
+            };
+        }"#;
+        let nix = parse_nix(input).unwrap();
+        let m = PackageManifest::from_nix(&nix).unwrap();
+
+        let rendered = m.phantom_spoofs_nix().expect("spoof fragment");
+        let parsed_back = parse_nix(&format!(
+            "{{ name = \"glibc\"; version = \"2.39\"; origin = \"archlinux\"; {rendered} }}"
+        ))
+        .unwrap();
+        let m2 = PackageManifest::from_nix(&parsed_back).unwrap();
+        assert_eq!(m.phantom_spoofs, m2.phantom_spoofs);
+    }
+
+    #[test]
+    fn test_spoof_target_from_str_and_as_str() {
+        assert_eq!("debian".parse::<SpoofTarget>().unwrap(), SpoofTarget::Debian);
+        assert_eq!(
+            "archlinux".parse::<SpoofTarget>().unwrap(),
+            SpoofTarget::Arch
+        );
+        assert_eq!("fedora".parse::<SpoofTarget>().unwrap(), SpoofTarget::Rpm);
+        assert_eq!(SpoofTarget::Void.as_str(), "void");
+        assert_eq!(SpoofTarget::Arch.canonical_origin(), "archlinux");
+        assert!("plan9".parse::<SpoofTarget>().is_err());
+        assert_eq!(SpoofTarget::from_origin("pypi"), None);
+    }
+
+    #[test]
+    fn test_resolve_auto_spoofs_glibc() {
+        let rows = resolve_auto_spoofs("archlinux", "glibc");
+        assert!(
+            rows.iter()
+                .any(|(t, e)| *t == SpoofTarget::Debian && e.name == "libc6"),
+            "rows: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(t, e)| *t == SpoofTarget::Debian && e.name == "libc6-dev")
+        );
+        assert!(
+            rows.iter()
+                .any(|(t, e)| *t == SpoofTarget::Rpm && e.name == "glibc-devel")
+        );
+
+        // Origin aliases normalize to the same namespace.
+        assert_eq!(
+            resolve_auto_spoofs("arch", "glibc").len(),
+            rows.len()
+        );
+
+        // Reverse direction: Debian libc6 → Arch glibc.
+        let reverse = resolve_auto_spoofs("debian", "libc6");
+        assert!(
+            reverse
+                .iter()
+                .any(|(t, e)| *t == SpoofTarget::Arch && e.name == "glibc"),
+            "reverse: {reverse:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_auto_spoofs_unknown_is_empty() {
+        assert!(resolve_auto_spoofs("archlinux", "no-such-package").is_empty());
+        assert!(resolve_auto_spoofs("pypi", "numpy").is_empty());
+    }
+
+    #[test]
+    fn test_spoof_mappings_toml_is_well_formed() {
+        let records = parse_spoof_mappings(SPOOF_MAPPINGS_TOML).unwrap();
+        assert!(records.len() >= 10, "records: {}", records.len());
+        assert!(records.iter().any(|r| r.name == "glibc"));
+        assert!(
+            parse_spoof_mappings("[[spoof]]\norigin = \"x\"\nname = \"y\"\n").is_err()
+        );
+    }
+
+    #[test]
+    fn test_manifest_deserializes_without_spoof_field() {
+        let json = r#"{
+            "identity": { "origin": "archlinux", "name": "htop", "version": "3.3.0", "aliases": [] },
+            "archive": null,
+            "format": "ExtractedTree",
+            "requires": [],
+            "suggests": [],
+            "build_requires": [],
+            "capabilities": { "binaries": [], "libraries": [], "virtual_caps": [], "resources": [] },
+            "security": null
+        }"#;
+        let m: PackageManifest = serde_json::from_str(json).unwrap();
+        assert!(m.phantom_spoofs.is_empty());
     }
 }

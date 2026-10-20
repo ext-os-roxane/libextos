@@ -10,6 +10,8 @@
 //! - Null: `null`
 //! - Lists: `[ "a" "b" 42 ]`
 //! - Attribute sets: `{ key = value; nested.key = value; }`
+//!   (Nix-compatible: the final binding may omit its trailing `';'`,
+//!   e.g. `{ name = "glibc" }`; `';'` is still required between bindings)
 //! - `rec { }` recursive attribute sets (syntactically accepted, treated as regular attrsets)
 //! - Comments: `# line comment`, `/* block comment */`
 //! - Identifiers and dotted paths: `foo`, `foo.bar.baz`
@@ -506,15 +508,48 @@ impl Parser {
     }
 
     /// Parse bare `key = value;` bindings until EOF.
+    ///
+    /// As inside an attribute set, the last binding may omit its trailing
+    /// `';'` when it is immediately followed by end of input.
     fn parse_bindings_to_eof(&mut self) -> Result<NixValue, ExtosError> {
         let mut map = BTreeMap::new();
         while *self.peek() != Token::Eof {
             self.parse_binding(&mut map)?;
+            self.expect_binding_terminator(&Token::Eof, "end of input")?;
         }
         Ok(NixValue::AttrSet(map))
     }
 
-    /// Parse a single `key = value;` or `key.sub.path = value;` binding.
+    /// Consume the terminator that follows a binding's value.
+    ///
+    /// Nix-compatible: `';'` separates bindings, so the *last* binding of a
+    /// collection may omit it when the closing token comes right next
+    /// (`{ name = "glibc" }`). Between bindings the `';'` remains mandatory
+    /// (`{ a = 1 b = 2 }` is still a parse error).
+    fn expect_binding_terminator(
+        &mut self,
+        closer: &Token,
+        closer_desc: &str,
+    ) -> Result<(), ExtosError> {
+        if *self.peek() == Token::Semi {
+            self.advance();
+            return Ok(());
+        }
+        if self.peek() == closer {
+            return Ok(());
+        }
+        let got = self.peek().clone();
+        Err(ExtosError::ConfigParse {
+            path: self.path.clone(),
+            line: 0,
+            message: format!("expected ';' or {closer_desc} after binding value, got {got:?}"),
+        })
+    }
+
+    /// Parse a single `key = value` or `key.sub.path = value` binding.
+    ///
+    /// The trailing `';'` is *not* consumed here; callers decide whether it
+    /// may be omitted (see [`Parser::expect_binding_terminator`]).
     fn parse_binding(&mut self, map: &mut BTreeMap<String, NixValue>) -> Result<(), ExtosError> {
         // Read the key path: `key` or `key.sub.path`
         let mut path_parts = Vec::new();
@@ -547,7 +582,6 @@ impl Parser {
 
         self.expect(&Token::Equals)?;
         let value = self.parse_value()?;
-        self.expect(&Token::Semi)?;
 
         // Insert into nested map structure
         insert_dotted(map, &path_parts, value);
@@ -623,7 +657,9 @@ impl Parser {
         Ok(NixValue::List(items))
     }
 
-    /// Parse `{ key = value; ... }`
+    /// Parse `{ key = value; ... }`.
+    ///
+    /// The last binding may omit its trailing `';'` (Nix-compatible).
     fn parse_attrset(&mut self) -> Result<NixValue, ExtosError> {
         self.expect(&Token::LBrace)?;
         let mut map = BTreeMap::new();
@@ -636,6 +672,7 @@ impl Parser {
                 });
             }
             self.parse_binding(&mut map)?;
+            self.expect_binding_terminator(&Token::RBrace, "'}'")?;
         }
         self.expect(&Token::RBrace)?;
         Ok(NixValue::AttrSet(map))
@@ -910,6 +947,105 @@ mod tests {
         assert_eq!(
             val.get_path("items"),
             Some(&NixValue::List(Vec::new()))
+        );
+    }
+
+    // ── Nix-compatible optional trailing `;` on the last binding ──
+
+    #[test]
+    fn test_single_binding_without_trailing_semicolon() {
+        let with_semi = parse_nix(r#"{ name = "glibc"; }"#).unwrap();
+        let without_semi = parse_nix(r#"{ name = "glibc" }"#).unwrap();
+        assert_eq!(without_semi, with_semi);
+        assert_eq!(without_semi.get_str("name"), Some("glibc"));
+    }
+
+    #[test]
+    fn test_last_binding_without_semicolon_after_other_bindings() {
+        let val = parse_nix(r#"{ a = 1; b = 2 }"#).unwrap();
+        assert_eq!(val.get_path("a").and_then(|v| v.as_int()), Some(1));
+        assert_eq!(val.get_path("b").and_then(|v| v.as_int()), Some(2));
+    }
+
+    #[test]
+    fn test_missing_semicolon_between_bindings_is_error() {
+        // The invariant: `;` separates bindings and may only be omitted
+        // before the closing `}` — never mid-listing.
+        let err = parse_nix(r#"{ a = 1 b = 2 }"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected ';' or '}'"),
+            "error message should be specific, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_nested_manifest_without_any_trailing_semicolons() {
+        // Only the *last* binding of each attrset omits its `;`; separators
+        // between bindings are still present (Nix semantics).
+        let input = r#"
+        {
+            system = {
+                name = "workstation-alpha";
+                weaveMode = "reflink";
+                init = { provider = extos.s6-linux-init };
+                packages = [
+                    { name = "glibc" }
+                    { name = "musl"; origin = "alpine"; version = "1.2.5-r0" }
+                    { name = "busybox"; origin = "alpine" }
+                ]
+            }
+        }
+        "#;
+        let val = parse_nix(input).unwrap();
+        assert_eq!(val.get_str("system.name"), Some("workstation-alpha"));
+        assert_eq!(val.get_str("system.weaveMode"), Some("reflink"));
+        assert_eq!(
+            val.get_str("system.init.provider"),
+            Some("extos.s6-linux-init")
+        );
+        let pkgs = val.get_path("system.packages").unwrap().as_list().unwrap();
+        assert_eq!(pkgs.len(), 3);
+        assert_eq!(pkgs[0].get_str("name"), Some("glibc"));
+        assert_eq!(pkgs[1].get_str("origin"), Some("alpine"));
+        assert_eq!(pkgs[1].get_str("version"), Some("1.2.5-r0"));
+        assert!(
+            pkgs[0].get_path("origin").is_none(),
+            "unexpected extra attribute in first package"
+        );
+    }
+
+    #[test]
+    fn test_package_list_without_trailing_semicolon() {
+        // Exact shape of a commonly hand-written manifest snippet: the
+        // one-binding attrsets carry no `;` and the list closes with `]`.
+        let input = r#"{
+            packages = [
+                { name = "glibc" }
+                { name = "musl"; origin = "alpine"; version = "1.2.5-r0" }
+            ]
+        }"#;
+        let val = parse_nix(input).unwrap();
+        let pkgs = val.get_path("packages").unwrap().as_list().unwrap();
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].get_str("name"), Some("glibc"));
+        assert_eq!(pkgs[1].get_str("version"), Some("1.2.5-r0"));
+    }
+
+    #[test]
+    fn test_bare_bindings_last_without_semicolon() {
+        let val = parse_nix("name = \"hyprland\";\nversion = \"0.39.1\"").unwrap();
+        assert_eq!(val.get_str("name"), Some("hyprland"));
+        assert_eq!(val.get_str("version"), Some("0.39.1"));
+    }
+
+    #[test]
+    fn test_bare_bindings_missing_semicolon_between_bindings_is_error() {
+        let err = parse_nix("a = 1 b = 2").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected ';' or end of input"),
+            "error message should be specific, got: {msg}"
         );
     }
 }

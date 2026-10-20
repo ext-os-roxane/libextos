@@ -13,10 +13,12 @@
 //!
 //! ## Plugin Discovery
 //!
-//! Plugins are discovered at runtime from:
-//! 1. `/config/rosetta/plugins/*.so` (production)
-//! 2. `./config/rosetta/plugins/*.so` (development)
-//! 3. `ROSETTA_PLUGIN_DIR` environment variable
+//! Tier-0 shared objects are discovered at runtime from:
+//! 1. `$ROSETTA_PLUGIN_DIR` (explicit override, if set)
+//! 2. `/config/rosetta/plugins/*.so` (production)
+//! 3. `./config/rosetta/plugins/*.so` (development)
+//!
+//! Only files named `librosetta-*.so` are considered.
 //!
 //! ## C ABI Contract
 //!
@@ -34,9 +36,29 @@
 //! void rosetta_cleanup();
 //! ```
 
+//! ## Built-in (Tier-0) translators
+//!
+//! The five roof-native origins — Arch, Debian, Alpine, Void and RPM — ship as
+//! **built-in** plugins compiled into `libextos` ([`arch::ArchPlugin`],
+//! [`debian::DebianPlugin`], [`alpine::AlpinePlugin`], [`void_xbps::VoidPlugin`],
+//! [`rpm::RpmPlugin`]). They are registered by
+//! [`registry::RosettaRegistry::default`], so no `.so` needs to exist for the
+//! common origins. A dynamically loaded `librosetta-*.so` for the same origin is
+//! registered *after* the built-ins and therefore shadows them (Tier-0 override).
+//!
+//! Built-ins implement the `PARSE` and `TRANSLATE` capabilities only: fetching,
+//! extraction, database sync and PhantomDB writing stay with the upstream
+//! package managers and with `crate::phantom`.
+
+pub mod alpine;
+pub mod arch;
+pub mod common;
+pub mod debian;
 pub mod ffi;
 pub mod loader;
 pub mod registry;
+pub mod rpm;
+pub mod void_xbps;
 
 use std::path::Path;
 

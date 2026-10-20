@@ -13,6 +13,8 @@ pub mod error;
 pub mod extract;
 pub mod ingest;
 pub mod manifest;
+pub mod phantom;
 pub mod rosetta;
+pub mod snapshot;
 pub mod types;
 pub mod weaver;

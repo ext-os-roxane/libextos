@@ -31,12 +31,17 @@ impl RosettaRegistry {
         }
     }
 
-    /// Create a registry pre-loaded with all discovered plugins.
+    /// Create a registry pre-loaded with the built-in translators *and* every
+    /// discovered `.so` plugin.
     ///
-    /// Scans standard paths and `$ROSETTA_PLUGIN_DIR` for `.so` files.
-    /// Plugins that fail to load are logged as warnings but don't block startup.
+    /// Built-ins ([`RosettaRegistry::register_builtins`]) are registered first,
+    /// then `.so` files found via [`loader::discover_plugins`] are layered on
+    /// top — a Tier-0 shared object for the same origin shadows the built-in
+    /// implementation. Plugins that fail to load are logged as warnings but
+    /// don't block startup.
     pub fn discover() -> Self {
         let mut registry = Self::new();
+        registry.register_builtins();
         let paths = loader::discover_plugins();
 
         for path in &paths {
@@ -64,6 +69,10 @@ impl RosettaRegistry {
     }
 
     /// Create a registry by scanning a specific directory.
+    ///
+    /// Unlike [`RosettaRegistry::discover`], this does **not** pre-register the
+    /// built-in translators: it only contains what is found in `dir` (used by
+    /// tests and by explicit plugin-path configuration).
     pub fn discover_in(dir: &Path) -> Self {
         let mut registry = Self::new();
         let paths = loader::discover_plugins_in(dir);
@@ -116,6 +125,32 @@ impl RosettaRegistry {
         }
     }
 
+    /// Register the five built-in (Tier-0) translators.
+    ///
+    /// `archlinux`, `debian`, `alpine`, `void` and `rpm` are always available
+    /// without any shared object on disk; the usual upstream aliases
+    /// (`arch`, `pacman`, `ubuntu`, `apk`, `xbps`, `fedora`, `suse`, ...) resolve
+    /// to the same instances. Called by [`RosettaRegistry::default`] and
+    /// [`RosettaRegistry::discover`]; calling it again simply re-registers the
+    /// built-ins (a previously registered `.so` for the same origin is replaced,
+    /// so call it *before* loading Tier-0 overrides).
+    pub fn register_builtins(&mut self) {
+        use crate::rosetta::alpine::AlpinePlugin;
+        use crate::rosetta::arch::ArchPlugin;
+        use crate::rosetta::debian::DebianPlugin;
+        use crate::rosetta::rpm::RpmPlugin;
+        use crate::rosetta::void_xbps::VoidPlugin;
+
+        self.register_with_aliases(ArchPlugin, &["arch", "pacman"]);
+        self.register_with_aliases(DebianPlugin, &["ubuntu", "apt", "dpkg"]);
+        self.register_with_aliases(AlpinePlugin, &["apk"]);
+        self.register_with_aliases(VoidPlugin, &["voidlinux", "xbps"]);
+        self.register_with_aliases(
+            RpmPlugin,
+            &["suse", "opensuse", "fedora", "centos", "rhel", "dnf", "zypper"],
+        );
+    }
+
     /// Look up a plugin by origin name or alias.
     pub fn get(&self, origin: &str) -> Option<Arc<dyn RosettaPlugin>> {
         self.plugins.get(origin).cloned()
@@ -138,8 +173,16 @@ impl RosettaRegistry {
 }
 
 impl Default for RosettaRegistry {
+    /// A registry pre-loaded with the built-in translators for the five
+    /// roof-native origins.
+    ///
+    /// No filesystem is touched: built-ins need no `.so`. Use
+    /// [`RosettaRegistry::discover`] when Tier-0 plugin overrides should be
+    /// loaded as well.
     fn default() -> Self {
-        Self::new()
+        let mut registry = Self::new();
+        registry.register_builtins();
+        registry
     }
 }
 

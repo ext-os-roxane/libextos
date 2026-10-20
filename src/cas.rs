@@ -501,6 +501,29 @@ impl CasRepository {
         Ok(())
     }
 
+    /// Garbage-collect every object that is not reachable from a ref.
+    ///
+    /// This is the PLAN 2.2.5 entry point and a thin, documented alias of
+    /// [`CasRepository::gc`]: the reachability walk already resolves
+    /// `<refs>/<origin>/<pkg>/<ver>` *and* the sibling `current` symlink chain
+    /// exactly (via `fs::canonicalize`), and the sweep only deletes object
+    /// directories whose hash is absent from that live set. No other
+    /// behaviour is layered on top, so both names share one implementation and
+    /// cannot drift.
+    ///
+    /// Returns the sorted list of purged object hashes.
+    ///
+    /// # Guarantees
+    /// - An object referenced by *any* ref row — a concrete version or a
+    ///   `current` symlink that still resolves — is never deleted.
+    /// - Dangling refs (a `current` symlink whose target version was removed)
+    ///   are ignored during the walk instead of aborting the collection.
+    /// - Refs pointing outside of `<root>/objects` are not treated as live
+    ///   (they do not name a CAS object) and are likewise ignored.
+    pub fn garbage_collect(&self) -> Result<Vec<String>, ExtosError> {
+        self.gc()
+    }
+
     /// Garbage collect: remove all objects not reachable from any ref.
     /// Returns the list of purged hashes.
     pub fn gc(&self) -> Result<Vec<String>, ExtosError> {
@@ -567,6 +590,127 @@ impl CasRepository {
         pkgs.sort();
         Ok(pkgs)
     }
+
+    /// List every concrete ref in the repository as a flat table.
+    ///
+    /// Walks `refs/<origin>/<pkg>/<version>` and returns one [`RefEntry`] per
+    /// version ref, sorted by `(origin, name, version)`. The pseudo-version
+    /// `current` (a symlink to a sibling version ref) is skipped so callers see
+    /// only concrete versions.
+    ///
+    /// Origins without any version refs (empty namespaces created by
+    /// [`CasRepository::create_namespace`]) contribute no rows.
+    pub fn list_refs(&self) -> Result<Vec<RefEntry>, ExtosError> {
+        let mut entries = Vec::new();
+        for origin in self.list_origins()? {
+            for name in self.list_packages(&origin)? {
+                for version in self.list_versions(&origin, &name)? {
+                    entries.push(RefEntry {
+                        origin: origin.clone(),
+                        name: name.clone(),
+                        version,
+                    });
+                }
+            }
+        }
+        entries.sort_by(|a, b| {
+            (&a.origin, &a.name, &a.version).cmp(&(&b.origin, &b.name, &b.version))
+        });
+        Ok(entries)
+    }
+
+    // ── File search ──
+
+    /// Search every referenced package for files whose relative path matches
+    /// `query` (PLAN 2.2.2).
+    ///
+    /// The search walks the `content/` tree behind each ref — the authoritative
+    /// file list, since `manifest.nix` carries identity/capabilities rather than
+    /// an explicit file index — and matches with [`matches_query`]:
+    ///
+    /// - a plain query is a case-sensitive substring of the relative path;
+    /// - a query starting with `/` is anchored and matches a relative-path
+    ///   *suffix* at a path boundary (`/usr/bin/sh` ⇒ `usr/bin/sh` or
+    ///   `some/prefix/usr/bin/sh`, not `notusr/bin/sh`);
+    /// - `?` matches one byte of a single path segment and `*` matches any run
+    ///   of bytes inside one segment, so `*.so` finds `usr/lib/libz.so` and
+    ///   `/usr/lib/*` restricts the search to `usr/lib/`.
+    ///
+    /// One [`FileHit`] is returned per matching file. Objects are visited once:
+    /// when several version refs (or several packages) resolve to the very same
+    /// object, the first ref in `list_refs()` order owns the hit. A future
+    /// `--all-versions` flag can lift that de-duplication without changing the
+    /// signature.
+    ///
+    /// Dangling refs and refs whose object lacks a readable `content/` tree are
+    /// skipped so one broken ref cannot fail the whole search; an unreadable
+    /// content directory *inside* a tree is reported as an error so callers can
+    /// fall back to a direct tree scan.
+    ///
+    /// Results are sorted by ref then path, making the output deterministic.
+    pub fn search_files(&self, query: &str) -> Result<Vec<FileHit>, ExtosError> {
+        let mut hits = Vec::new();
+        if query.trim().is_empty() {
+            return Ok(hits);
+        }
+
+        let mut searched: HashSet<String> = HashSet::new();
+        for entry in self.list_refs()? {
+            let hash = match self.resolve_ref(&entry.origin, &entry.name, &entry.version) {
+                Ok(hash) => hash,
+                // Dangling ref: nothing to search, keep walking.
+                Err(_) => continue,
+            };
+            if !searched.insert(hash.clone()) {
+                continue;
+            }
+            let content = match self.retrieve(&hash) {
+                Ok(path) if path.is_dir() => path,
+                _ => continue,
+            };
+
+            let mut matches = Vec::new();
+            collect_file_matches(&content, &content, query, &mut matches)?;
+            for rel in matches {
+                hits.push(FileHit {
+                    _ref: entry.clone(),
+                    path: format!("/{rel}"),
+                });
+            }
+        }
+
+        hits.sort();
+        Ok(hits)
+    }
+}
+
+/// One file-search result (see [`CasRepository::search_files`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileHit {
+    /// Ref whose object contains the matched file.
+    ///
+    /// Named `_ref` to match the field spelled out in PLAN 2.2.2.
+    pub _ref: RefEntry,
+    /// Matched path relative to the object's `content/` root, with a leading `/`.
+    pub path: String,
+}
+
+/// A single semantic ref row: `refs/<origin>/<name>/<version>`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RefEntry {
+    /// Origin namespace (e.g. `archlinux`, `debian`, `scratch`)
+    pub origin: String,
+    /// Package name as recorded upstream
+    pub name: String,
+    /// Concrete version (never `current`)
+    pub version: String,
+}
+
+impl RefEntry {
+    /// Render the row as `origin/name version`.
+    pub fn label(&self) -> String {
+        format!("{}/{} {}", self.origin, self.name, self.version)
+    }
 }
 
 /// A resolved lockfile entry.
@@ -609,6 +753,129 @@ fn resolve_symlink_bounded(path: &Path, max_depth: usize) -> Result<PathBuf, Ext
         expected: format!("symlink resolved within {max_depth} hops"),
         actual: format!("ELOOP: symlink cycle detected at {}", path.display()),
     })
+}
+
+// ─── File Search Helpers ────────────────────────────────────────
+
+/// Match a relative path against a `pkt -F` query (see
+/// [`CasRepository::search_files`] for the exact semantics).
+///
+/// Leading/trailing `/` on either side are insignificant. An empty query never
+/// matches. Implemented by hand — no regular expressions are involved.
+pub fn matches_query(relative_path: &str, query: &str) -> bool {
+    let rel = relative_path.trim_matches('/');
+    let query = query.trim();
+    if rel.is_empty() || query.is_empty() {
+        return false;
+    }
+
+    let anchored = query.starts_with('/');
+    let pattern = query.trim_matches('/');
+    if pattern.is_empty() {
+        return false;
+    }
+
+    let path_segs: Vec<&str> = rel.split('/').collect();
+    let pattern_segs: Vec<&str> = pattern.split('/').collect();
+    let has_glob = pattern_segs
+        .iter()
+        .any(|seg| seg.contains('*') || seg.contains('?'));
+
+    if !has_glob {
+        return if anchored {
+            suffix_segments_match(&path_segs, &pattern_segs)
+        } else {
+            rel.contains(pattern)
+        };
+    }
+
+    if glob_path_match(&path_segs, &pattern_segs) {
+        return true;
+    }
+    if anchored || pattern_segs.len() > 1 {
+        return glob_suffix_match(&path_segs, &pattern_segs);
+    }
+    // Single-segment glob (`*.so`): any segment may match.
+    path_segs
+        .iter()
+        .any(|segment| glob_segment_match(segment, pattern))
+}
+
+/// Collect the relative paths under `base` matching `query`.
+fn collect_file_matches(
+    base: &Path,
+    dir: &Path,
+    query: &str,
+    out: &mut Vec<String>,
+) -> Result<(), ExtosError> {
+    let mut entries = fs::read_dir(dir)?
+        .collect::<Result<Vec<fs::DirEntry>, io::Error>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_file_matches(base, &path, query, out)?;
+            continue;
+        }
+        // Regular files and symlinks (never followed) are searchable entries.
+        let rel = match path.strip_prefix(base) {
+            Ok(rel) => rel,
+            Err(_) => path.as_path(),
+        };
+        let rel = rel.to_string_lossy().to_string();
+        if matches_query(&rel, query) {
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` ends with the literal segment sequence `suffix`.
+fn suffix_segments_match(path: &[&str], suffix: &[&str]) -> bool {
+    if suffix.len() > path.len() {
+        return false;
+    }
+    path[path.len() - suffix.len()..] == suffix[..]
+}
+
+/// Full-path glob match; `**` spans zero or more segments.
+fn glob_path_match(path: &[&str], pattern: &[&str]) -> bool {
+    let Some((segment, rest)) = pattern.split_first() else {
+        return path.is_empty();
+    };
+    if *segment == "**" {
+        return (0..=path.len()).any(|skip| glob_path_match(&path[skip..], rest));
+    }
+    let Some((head, path_rest)) = path.split_first() else {
+        return false;
+    };
+    glob_segment_match(head, segment) && glob_path_match(path_rest, rest)
+}
+
+/// Glob match at any segment boundary.
+fn glob_suffix_match(path: &[&str], pattern: &[&str]) -> bool {
+    (0..path.len()).any(|start| glob_path_match(&path[start..], pattern))
+}
+
+/// Match one path segment against a `*`/`?` pattern (no `/` crossing).
+fn glob_segment_match(segment: &str, pattern: &str) -> bool {
+    segment_glob(segment.as_bytes(), pattern.as_bytes())
+}
+
+fn segment_glob(text: &[u8], pattern: &[u8]) -> bool {
+    let Some((lead, rest)) = pattern.split_first() else {
+        return text.is_empty();
+    };
+    match lead {
+        b'*' => {
+            segment_glob(text, rest)
+                || (!text.is_empty() && segment_glob(&text[1..], pattern))
+        }
+        b'?' => !text.is_empty() && segment_glob(&text[1..], rest),
+        byte => text.first() == Some(byte) && segment_glob(&text[1..], rest),
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -819,6 +1086,48 @@ mod tests {
     }
 
     #[test]
+    fn test_list_refs() {
+        let (_dir, repo) = tmp_repo();
+        let hash = repo.store_bytes(b"pkg").unwrap();
+        repo.create_ref("archlinux", "htop", "3.3.0", &hash).unwrap();
+        repo.update_current("archlinux", "htop", "3.3.0").unwrap();
+        repo.create_ref("archlinux", "htop", "3.2.0", &hash).unwrap();
+        repo.create_ref("debian", "vim", "9.1.0-1", &hash).unwrap();
+
+        let rows = repo.list_refs().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                RefEntry {
+                    origin: "archlinux".into(),
+                    name: "htop".into(),
+                    version: "3.2.0".into(),
+                },
+                RefEntry {
+                    origin: "archlinux".into(),
+                    name: "htop".into(),
+                    version: "3.3.0".into(),
+                },
+                RefEntry {
+                    origin: "debian".into(),
+                    name: "vim".into(),
+                    version: "9.1.0-1".into(),
+                },
+            ]
+        );
+        // `current` is a pseudo-version and must not appear as a row.
+        assert!(rows.iter().all(|r| r.version != "current"));
+        assert_eq!(rows[1].label(), "archlinux/htop 3.3.0");
+    }
+
+    #[test]
+    fn test_list_refs_empty_namespace() {
+        let (_dir, repo) = tmp_repo();
+        repo.create_namespace("scratch-ns").unwrap();
+        assert!(repo.list_refs().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_store_directory() {
         let tmpdir = tempfile::tempdir().unwrap();
         let src = tmpdir.path().join("source");
@@ -832,5 +1141,157 @@ mod tests {
 
         let content = repo.retrieve(&hash).unwrap();
         assert!(content.join("usr/bin/hello").exists());
+    }
+
+    // ── PLAN 2.2.2 / 2.2.5: file search + garbage collection ──
+
+    /// Store a small tree and return its hash: `usr/bin/hello`, `usr/lib/libz.so`.
+    fn store_sample_tree(repo: &CasRepository) -> String {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let src = tmpdir.path().join("sample");
+        fs::create_dir_all(src.join("usr/bin")).unwrap();
+        fs::create_dir_all(src.join("usr/lib")).unwrap();
+        fs::write(src.join("usr/bin/hello"), b"#!/bin/sh\necho hello").unwrap();
+        fs::write(src.join("usr/lib/libz.so"), b"ELF").unwrap();
+        repo.store_directory(&src).unwrap()
+    }
+
+    #[test]
+    fn test_matches_query_plain_and_anchored() {
+        // Plain query: case-sensitive substring, anywhere in the path.
+        assert!(matches_query("usr/bin/hello", "bin/hello"));
+        assert!(matches_query("usr/bin/hello", "hello"));
+        assert!(!matches_query("usr/bin/hello", "Hello"));
+        assert!(!matches_query("usr/bin/hello", "nope"));
+        assert!(!matches_query("usr/bin/hello", ""));
+
+        // Anchored query: exact relative path or a suffix at a path boundary.
+        assert!(matches_query("usr/bin/hello", "/usr/bin/hello"));
+        assert!(matches_query("opt/root/usr/bin/hello", "/usr/bin/hello"));
+        assert!(!matches_query("notusr/bin/hello", "/usr/bin/hello"));
+        assert!(!matches_query("usr/bin/hello", "/usr/bin"));
+
+        // Leading slashes on the stored path are insignificant.
+        assert!(matches_query("/usr/bin/hello", "/usr/bin/hello"));
+        assert!(matches_query("/usr/bin/hello", "bin/hello"));
+    }
+
+    #[test]
+    fn test_matches_query_glob() {
+        assert!(matches_query("usr/lib/libz.so", "*.so"));
+        assert!(matches_query("usr/lib/libz.so", "/usr/lib/*.so"));
+        assert!(!matches_query("usr/lib/libz.so", "/usr/bin/*.so"));
+        assert!(!matches_query("usr/lib/libz.so", "*.a"));
+        // `?` matches exactly one byte inside one segment.
+        assert!(matches_query("usr/lib/libz.so", "lib?.so"));
+        assert!(!matches_query("usr/lib/libzz.so", "lib?.so"));
+        // `*` never crosses a path separator (it can still match a basename).
+        assert!(!matches_query("usr/lib/libz.so", "usr*libz.so"));
+        assert!(matches_query("usr/lib/libz.so", "*so"));
+        assert!(matches_query("usr/lib/libz.so", "usr/*/libz.so"));
+        // `**` may span separators.
+        assert!(matches_query("usr/lib/libz.so", "usr/**/*.so"));
+    }
+
+    #[test]
+    fn test_search_files_finds_exact_path_and_glob() {
+        let (_dir, repo) = tmp_repo();
+        let hash = store_sample_tree(&repo);
+        repo.create_ref("archlinux", "hello", "1.0.0-1", &hash).unwrap();
+        repo.update_current("archlinux", "hello", "1.0.0-1").unwrap();
+
+        let hits = repo.search_files("/usr/bin/hello").unwrap();
+        assert_eq!(
+            hits,
+            vec![FileHit {
+                _ref: RefEntry {
+                    origin: "archlinux".into(),
+                    name: "hello".into(),
+                    version: "1.0.0-1".into(),
+                },
+                path: "/usr/bin/hello".into(),
+            }]
+        );
+
+        let hits = repo.search_files("*.so").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/usr/lib/libz.so");
+        assert_eq!(hits[0]._ref.name, "hello");
+
+        // Substring search also matches directories' children.
+        assert_eq!(repo.search_files("bin/hel").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_search_files_miss_is_empty() {
+        let (_dir, repo) = tmp_repo();
+        let hash = store_sample_tree(&repo);
+        repo.create_ref("archlinux", "hello", "1.0.0-1", &hash).unwrap();
+
+        assert!(repo.search_files("/no/such/file").unwrap().is_empty());
+        assert!(repo.search_files("*.a").unwrap().is_empty());
+        // An empty query never matches anything.
+        assert!(repo.search_files("  ").unwrap().is_empty());
+        // A fresh repository has no refs at all.
+        let (_other, empty) = tmp_repo();
+        assert!(empty.search_files("hello").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_search_files_dedups_shared_objects_and_skips_dangling_refs() {
+        let (_dir, repo) = tmp_repo();
+        let hash = store_sample_tree(&repo);
+        // Two versions and a virtual alias share one object: one hit only.
+        repo.create_ref("archlinux", "hello", "1.0.0-1", &hash).unwrap();
+        repo.create_ref("archlinux", "hello", "1.1.0-1", &hash).unwrap();
+        repo.update_current("archlinux", "hello", "1.1.0-1").unwrap();
+        repo.create_virtual_ref("hello", "1.1.0-1", "archlinux", "hello")
+            .unwrap();
+
+        let hits = repo.search_files("hello").unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0]._ref.version, "1.0.0-1");
+
+        // A dangling ref must not fail the search.
+        repo.create_ref("archlinux", "ghost", "9.9.9", "BLAKE3-missing").unwrap();
+        assert_eq!(repo.search_files("hello").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_garbage_collect_keeps_referenced_objects_purges_orphans() {
+        let (_dir, repo) = tmp_repo();
+        let live = repo.store_bytes(b"live package").unwrap();
+        let orphan = repo.store_bytes(b"orphan package").unwrap();
+        repo.create_ref("archlinux", "live", "1.0.0", &live).unwrap();
+        repo.update_current("archlinux", "live", "1.0.0").unwrap();
+
+        let purged = repo.garbage_collect().unwrap();
+        assert_eq!(purged, vec![orphan.clone()]);
+        assert!(!repo.object_path(&orphan).exists());
+        assert!(repo.object_path(&live).exists());
+        assert_eq!(repo.resolve_ref("archlinux", "live", "current").unwrap(), live);
+
+        // Idempotent: a second sweep has nothing left to purge.
+        assert!(repo.garbage_collect().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_garbage_collect_handles_stale_current_symlink() {
+        let (_dir, repo) = tmp_repo();
+        let live = repo.store_bytes(b"still referenced").unwrap();
+        let orphan = repo.store_bytes(b"unreferenced").unwrap();
+        repo.create_ref("archlinux", "mesa", "2.0", &live).unwrap();
+        repo.update_current("archlinux", "mesa", "2.0").unwrap();
+        // `current` -> ./1.0 (a version ref that no longer exists).
+        repo.update_current("archlinux", "mesa", "1.0").unwrap();
+        // ...while version 2.0 still references `live`.
+        repo.create_ref("archlinux", "mesa", "2.0", &live).unwrap();
+
+        let purged = repo.garbage_collect().unwrap();
+        assert_eq!(purged, vec![orphan.clone()]);
+        assert!(repo.object_path(&live).exists());
+        assert!(!repo.object_path(&orphan).exists());
+        // The dangling `current` symlink is left untouched (GC owns objects, not refs).
+        assert!(repo.ref_path("archlinux", "mesa", "current").symlink_metadata().is_ok());
     }
 }
