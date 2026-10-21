@@ -7,6 +7,40 @@
 //! 4. Scan ELF binaries → capabilities (M3.3)
 //! 5. Hash content → commit to CAS objects (M3.5)
 //! 6. Create refs symlinks
+//!
+//! # Phase 3 fetcher wiring
+//!
+//! The Phase-3 fetchers ([`crate::fetcher::alpm`], [`crate::fetcher::debian`],
+//! [`crate::fetcher::rpm`]) are opt-in transports for *artifact acquisition
+//! only*. They are wired at exactly one seam: [`download_from_mirror_to`] (and
+//! its convenience wrapper [`download_from_mirror`]) — the step that turns
+//! `origin/name=version` into a verified local archive path. Everything after
+//! that (extract → manifest → ELF scan → CAS commit → refs) is the unchanged
+//! pipeline below; the fetchers never re-implement it.
+//!
+//! | PLAN task | transport | code seam |
+//! |---|---|---|
+//! | 3.2.6 | libalpm (`AlpmFetch`) | [`download_from_mirror_to`] → `download_via_alpm` |
+//! | 3.3.4 | APT infrastructure (`DebianFetcher`) | [`download_from_mirror_to`] → `download_via_debian` |
+//! | 3.4.5 | RPM repository (`RpmFetcher`) | [`download_from_mirror_to`] → `download_via_rpm` |
+//!
+//! Selection is explicit and per origin: `EXTOS_FETCHER_<ORIGIN>` (see
+//! [`fetcher_env_var`]) accepts `alpm`, `debian`, `rpm` or `http`. Unset means
+//! the Phase-2 mirror chain ([`mirror_urls`] + `reqwest`), which stays the
+//! default for every origin. There is deliberately **no auto-detection** of
+//! transports: a fetcher needs a loadable transport library (`libalpm`) or an
+//! external tool (`gpg`), neither of which is hermetically present, so the
+//! default path stays transport-light. An unknown value is a typed
+//! [`ExtosError::ConfigParse`]; it never silently falls back to HTTP. Likewise,
+//! a missing transport library is a typed error naming what is absent — falling
+//! back is always an explicit user action
+//! (`EXTOS_FETCHER_<ORIGIN>=http`).
+//!
+//! `EXTOS_MIRRORS_<ORIGIN>` keeps its meaning under every transport: it is
+//! where the base URL(s) come from. For `alpm` the first entry must point at a
+//! repository directory (`.../core/os/x86_64`); for `debian` at the archive
+//! root (`https://deb.debian.org/debian`); for `rpm` at the repository root
+//! (`.../Everything/x86_64/os`).
 
 use std::fs;
 use std::io;
@@ -425,20 +459,159 @@ pub fn download_from_mirror(
     download_from_mirror_to(origin, name, version, &default_cache_dir())
 }
 
-/// Download `<origin>/<name>/<version>` from the configured mirrors into
-/// `cache_dir/<origin>/`.
+/// Download `<origin>/<name>/<version>` into `cache_dir/<origin>/`.
 ///
-/// Mirrors come from `EXTOS_MIRRORS_<ORIGIN>` (see [`mirrors_for_origin`]) and
-/// are tried in order. The archive is streamed to a `.part` file and renamed
-/// only after a complete, successful transfer, so a partial download can never
-/// be mistaken for a valid package. An already-cached file is reused without
-/// network access.
+/// The transport is chosen by `EXTOS_FETCHER_<ORIGIN>` (see [`FetcherKind`]);
+/// unset selects [`FetcherKind::Http`]. The mirror base URLs always come from
+/// `EXTOS_MIRRORS_<ORIGIN>` (see [`mirrors_for_origin`]).
+///
+/// With the default HTTP transport the mirrors are tried in order. The archive
+/// is streamed to a `.part` file and renamed only after a complete, successful
+/// transfer, so a partial download can never be mistaken for a valid package.
+/// An already-cached file is reused without network access.
+///
+/// With a Phase-3 fetcher (`alpm`, `debian`, `rpm`) the fetcher owns transfer
+/// and caching: it may re-sync its repository index before handing back a
+/// cache-hit, and every returned path has already been size-checked and
+/// (according to the configured policy) signature-verified. A missing transport
+/// library is a typed error naming it — never a silent HTTP fallback.
 ///
 /// Errors:
-/// - [`ExtosError::ConfigParse`] — no mirror configured, or every mirror failed
-///   for a non-404 reason (message lists each attempted URL)
-/// - [`ExtosError::PackageNotFound`] — every mirror answered 404
+/// - [`ExtosError::ConfigParse`] — no mirror configured, an unknown
+///   `EXTOS_FETCHER_<ORIGIN>` value, a missing transport library/tool, or every
+///   mirror failed for a non-404 reason (message lists each attempted URL)
+/// - [`ExtosError::PackageNotFound`] — every mirror answered 404, or the
+///   repository/index does not carry the requested package/version
+/// - [`ExtosError::CasIntegrity`] — a fetcher size/signature verification failed
 pub fn download_from_mirror_to(
+    origin: &str,
+    name: &str,
+    version: &str,
+    cache_dir: &Path,
+) -> Result<PathBuf, ExtosError> {
+    match fetcher_for_origin(origin)? {
+        FetcherKind::Http => download_via_http(origin, name, version, cache_dir),
+        FetcherKind::Alpm => download_via_alpm(origin, name, version, cache_dir),
+        FetcherKind::Debian => download_via_debian(origin, name, version, cache_dir),
+        FetcherKind::Rpm => download_via_rpm(origin, name, version, cache_dir),
+    }
+}
+
+/// Transport that acquires an artifact for an origin (PLAN 3.2.6 / 3.3.4 / 3.4.5).
+///
+/// Selected per origin by `EXTOS_FETCHER_<ORIGIN>`; see [`fetcher_env_var`].
+/// [`FetcherKind::Http`] is the default and reproduces the Phase-2 mirror
+/// chain byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetcherKind {
+    /// Phase-2 `EXTOS_MIRRORS_<ORIGIN>` + blocking `reqwest` transfer.
+    Http,
+    /// `libalpm` sync database + package resolution ([`crate::fetcher::alpm`]).
+    Alpm,
+    /// APT `InRelease`/`Packages` chain ([`crate::fetcher::debian`]).
+    Debian,
+    /// RPM `repomd.xml`/`primary` chain ([`crate::fetcher::rpm`]).
+    Rpm,
+}
+
+impl FetcherKind {
+    /// Every accepted value of `EXTOS_FETCHER_<ORIGIN>`, in help order.
+    pub const ACCEPTED: [&'static str; 4] = ["http", "alpm", "debian", "rpm"];
+
+    /// Stable lowercase spelling accepted by `EXTOS_FETCHER_<ORIGIN>`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Alpm => "alpm",
+            Self::Debian => "debian",
+            Self::Rpm => "rpm",
+        }
+    }
+
+    /// Parse a configured fetcher name.
+    ///
+    /// Surrounding whitespace and ASCII case are ignored; an empty value means
+    /// "unset" and selects [`FetcherKind::Http`]. Every accepted value is listed
+    /// in [`FetcherKind::ACCEPTED`]. Anything else is a typed
+    /// [`ExtosError::ConfigParse`] — never a silent HTTP fallback.
+    ///
+    /// # Errors
+    ///
+    /// [`ExtosError::ConfigParse`] for an unrecognized transport name.
+    pub fn parse(raw: &str) -> Result<Self, ExtosError> {
+        let value = raw.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "" | "http" => Ok(Self::Http),
+            "alpm" => Ok(Self::Alpm),
+            "debian" => Ok(Self::Debian),
+            "rpm" => Ok(Self::Rpm),
+            _ => Err(ExtosError::ConfigParse {
+                path: "EXTOS_FETCHER_*".to_string(),
+                line: 0,
+                message: format!(
+                    "unknown fetcher '{raw}'; accepted values are: {}",
+                    Self::ACCEPTED.join(", ")
+                ),
+            }),
+        }
+    }
+}
+
+/// Environment variable naming the fetcher for an origin.
+///
+/// Follows the same sanitization as [`mirror_env_var`]: `archlinux` →
+/// `EXTOS_FETCHER_ARCHLINUX`, `shadichy-labs` → `EXTOS_FETCHER_SHADICHY_LABS`.
+#[must_use]
+pub fn fetcher_env_var(origin: &str) -> String {
+    let mut out = String::from("EXTOS_FETCHER_");
+    for ch in origin.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// Resolve the configured [`FetcherKind`] for `origin`.
+///
+/// Reads `EXTOS_FETCHER_<ORIGIN>` ([`fetcher_env_var`]). Unset or empty means
+/// [`FetcherKind::Http`]; an unknown value is a typed error from
+/// [`FetcherKind::parse`].
+///
+/// # Errors
+///
+/// [`ExtosError::ConfigParse`] for an unrecognized transport name.
+pub fn fetcher_for_origin(origin: &str) -> Result<FetcherKind, ExtosError> {
+    fetcher_from_lookup(origin, |key| std::env::var(key).ok())
+}
+
+/// Lookup-injectable form of [`fetcher_for_origin`] (used by unit tests).
+///
+/// On an unknown name the error path is rewritten to the concrete environment
+/// variable so the message names the knob to fix.
+fn fetcher_from_lookup<F>(origin: &str, lookup: F) -> Result<FetcherKind, ExtosError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let var = fetcher_env_var(origin);
+    match lookup(&var) {
+        None => Ok(FetcherKind::Http),
+        Some(raw) => FetcherKind::parse(&raw).map_err(|err| match err {
+            ExtosError::ConfigParse { message, .. } => ExtosError::ConfigParse {
+                path: var,
+                line: 0,
+                message: format!("origin '{origin}': {message}"),
+            },
+            other => other,
+        }),
+    }
+}
+
+/// Phase-2 mirror chain: `EXTOS_MIRRORS_<ORIGIN>` + blocking HTTP download.
+fn download_via_http(
     origin: &str,
     name: &str,
     version: &str,
@@ -493,6 +666,237 @@ pub fn download_from_mirror_to(
             failures.join("; ")
         ),
     })
+}
+
+// ─── Phase 3 fetcher transports (PLAN 3.2.6 / 3.3.4 / 3.4.5) ────
+
+/// Environment variable naming the alpm repository tree (`core`, `extra`, ...).
+const ALPM_REPO_ENV: &str = "EXTOS_ALPM_REPO";
+
+/// Environment variable tightening the alpm signature policy (`required`).
+const ALPM_SIGCHECK_ENV: &str = "EXTOS_ALPM_SIGCHECK";
+
+/// Environment variable naming the Debian suite/codename (`stable`, `bookworm`).
+const DEBIAN_DISTRO_ENV: &str = "EXTOS_DEBIAN_DISTRO";
+
+/// Environment variable naming the Debian component (`main`, `contrib`, ...).
+const DEBIAN_COMPONENT_ENV: &str = "EXTOS_DEBIAN_COMPONENT";
+
+/// Environment variable naming the Debian architecture (`amd64`, `arm64`, ...).
+const DEBIAN_ARCH_ENV: &str = "EXTOS_DEBIAN_ARCH";
+
+/// Environment variable naming an ASCII-armoured Debian release key file.
+const DEBIAN_SIGNING_KEY_ENV: &str = "EXTOS_DEBIAN_SIGNING_KEY";
+
+/// Environment variable naming an ASCII-armoured RPM release key file.
+const RPM_SIGNING_KEY_ENV: &str = "EXTOS_RPM_SIGNING_KEY";
+
+/// Default Debian suite used when [`DEBIAN_DISTRO_ENV`] is unset.
+const DEFAULT_DEBIAN_DISTRO: &str = "stable";
+
+/// Default Debian component used when [`DEBIAN_COMPONENT_ENV`] is unset.
+const DEFAULT_DEBIAN_COMPONENT: &str = "main";
+
+/// Non-empty, trimmed value of an environment variable.
+fn env_text(var: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// First configured mirror base for `origin`.
+///
+/// [`mirrors_for_origin`] guarantees a non-empty list, so the `None` branch is
+/// unreachable in practice; it exists to avoid indexing.
+fn first_mirror(origin: &str) -> Result<String, ExtosError> {
+    mirrors_for_origin(origin)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| unconfigured_mirror(origin, &mirror_env_var(origin)))
+}
+
+/// Read an ASCII-armoured signing key named by `var`, if configured.
+///
+/// # Errors
+///
+/// [`ExtosError::ConfigParse`] when the variable is set but the file cannot be
+/// read — a configured trust anchor must never be ignored silently.
+fn read_signing_key(var: &str) -> Result<Option<Vec<u8>>, ExtosError> {
+    let Some(path) = env_text(var) else {
+        return Ok(None);
+    };
+    let bytes = fs::read(&path).map_err(|error| ExtosError::ConfigParse {
+        path: var.to_string(),
+        line: 0,
+        message: format!("cannot read signing key '{path}': {error}"),
+    })?;
+    Ok(Some(bytes))
+}
+
+/// `libalpm`-backed acquisition (PLAN 3.2.6).
+///
+/// Syncs `<mirror>/<repo>.db` through [`crate::fetcher::alpm::AlpmFetch`], then
+/// resolves `name`/`version` in the loaded database and downloads the archive
+/// to `<cache_dir>/<origin>/`. The returned path is size-checked and, under the
+/// configured signature policy, PGP-verified by the fetcher.
+fn download_via_alpm(
+    origin: &str,
+    name: &str,
+    version: &str,
+    cache_dir: &Path,
+) -> Result<PathBuf, ExtosError> {
+    use crate::fetcher::alpm::{AlpmFetch, SigCheck, DEFAULT_REPO};
+
+    let base = first_mirror(origin)?;
+    let repo = env_text(ALPM_REPO_ENV).unwrap_or_else(|| DEFAULT_REPO.to_string());
+    let sigcheck = match env_text(ALPM_SIGCHECK_ENV)
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("optional") => SigCheck::Optional,
+        Some("required") => SigCheck::Required,
+        Some(other) => {
+            return Err(ExtosError::ConfigParse {
+                path: ALPM_SIGCHECK_ENV.to_string(),
+                line: 0,
+                message: format!(
+                    "unknown signature policy '{other}'; accepted values are: optional, required"
+                ),
+            });
+        }
+    };
+
+    // libalpm maps a sync database to <dbpath>/sync/<repo>.db; the private
+    // database lives next to the package cache and never leaks into the CAS.
+    let dbpath = cache_dir.join("alpm-db");
+    let mut fetcher = AlpmFetch::new(&dbpath)
+        .and_then(|fetcher| fetcher.with_repo(&repo))
+        .map_err(|error| alpm_error(origin, name, version, error))?;
+    fetcher = fetcher.with_cache_dir(cache_dir.join(origin));
+    fetcher
+        .sync_db(&base, sigcheck)
+        .and_then(|_db| fetcher.download(name, Some(version), sigcheck))
+        .map_err(|error| alpm_error(origin, name, version, error))
+}
+
+/// Convert an [`crate::fetcher::alpm::AlpmFetchError`] into the crate error.
+///
+/// Transport-library absence is reported as a configuration error that names
+/// the missing library and the escape hatch; integrity and lookup failures keep
+/// their own variants.
+fn alpm_error(
+    origin: &str,
+    name: &str,
+    version: &str,
+    error: crate::fetcher::alpm::AlpmFetchError,
+) -> ExtosError {
+    use crate::fetcher::alpm::{AlpmFetchError as E, ALPM_LIB_ENV, PACMAN_BUILD_DIR_ENV};
+
+    match &error {
+        E::NotAvailable { .. } => ExtosError::ConfigParse {
+            path: fetcher_env_var(origin),
+            line: 0,
+            message: format!(
+                "{error}; provide libalpm via {ALPM_LIB_ENV} or {PACMAN_BUILD_DIR_ENV}, \
+                 or retry with {}=http",
+                fetcher_env_var(origin)
+            ),
+        },
+        E::PackageNotFound { .. } | E::VersionNotFound { .. } => ExtosError::PackageNotFound {
+            origin: origin.to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+        },
+        E::MissingSignature { .. } | E::Signature { .. } | E::SizeMismatch { .. } => {
+            ExtosError::CasIntegrity {
+                expected: format!("a verified {origin} artifact for {name} {version}"),
+                actual: error.to_string(),
+            }
+        }
+        _ => ExtosError::ConfigParse {
+            path: mirror_env_var(origin),
+            line: 0,
+            message: error.to_string(),
+        },
+    }
+}
+
+/// APT-backed acquisition (PLAN 3.3.4).
+///
+/// Fetches `dists/<distro>/InRelease` (or `Release` + `Release.gpg`), verifies
+/// it with [`DEBIAN_SIGNING_KEY_ENV`] when configured, syncs the `Packages`
+/// index for `component`/`architecture`, then downloads the `.deb` and checks
+/// its size and SHA-256. Without a signing key the index is hash-checked but
+/// unsigned; that is logged, never hidden.
+fn download_via_debian(
+    origin: &str,
+    name: &str,
+    version: &str,
+    cache_dir: &Path,
+) -> Result<PathBuf, ExtosError> {
+    use crate::fetcher::debian::{DebianFetcher, SigCheck, DEFAULT_ARCH};
+
+    let base = first_mirror(origin)?;
+    let arch = env_text(DEBIAN_ARCH_ENV).unwrap_or_else(|| DEFAULT_ARCH.to_string());
+    let distro =
+        env_text(DEBIAN_DISTRO_ENV).unwrap_or_else(|| DEFAULT_DEBIAN_DISTRO.to_string());
+    let component =
+        env_text(DEBIAN_COMPONENT_ENV).unwrap_or_else(|| DEFAULT_DEBIAN_COMPONENT.to_string());
+
+    let fetcher = DebianFetcher::new(base, arch, cache_dir.join(origin))?.with_origin(origin);
+    let key = read_signing_key(DEBIAN_SIGNING_KEY_ENV)?;
+    let index = fetcher.sync_db(&distro, &component, key.as_deref())?;
+    let downloaded = match key.as_deref() {
+        Some(key) => fetcher.download(&index, name, version, SigCheck::Key(key))?,
+        None => {
+            tracing::warn!(
+                origin = %origin,
+                "no Debian release key configured; {DEBIAN_SIGNING_KEY_ENV} is unset, \
+                 so the index is only hash-checked"
+            );
+            fetcher.download(&index, name, version, SigCheck::Skip)?
+        }
+    };
+    Ok(downloaded.path)
+}
+
+/// RPM-repository-backed acquisition (PLAN 3.4.5).
+///
+/// Fetches `repodata/repomd.xml`, verifies it with [`RPM_SIGNING_KEY_ENV`] when
+/// configured, syncs the `primary` record, then downloads the `.rpm` and checks
+/// its size and digest. Without a key the transfer is hash-verified only (the
+/// fetcher logs that); with a key the package signature is checked through the
+/// `librpm-extos` bridge, whose absence is a typed error.
+///
+/// Note the pipeline boundary: the returned artifact is a verified `.rpm`, but
+/// archive *extraction* currently has no `.rpm` unpacker, so a full `-S` ingest
+/// of an RPM origin stops honestly at `ingest_local_archive_with_rosetta`
+/// (download-only `-S -w` succeeds). Adding the unpacker is Phase 4 work.
+fn download_via_rpm(
+    origin: &str,
+    name: &str,
+    version: &str,
+    cache_dir: &Path,
+) -> Result<PathBuf, ExtosError> {
+    use crate::fetcher::rpm::{RpmFetcher, SigCheck};
+
+    let base = first_mirror(origin)?;
+    let fetcher = RpmFetcher::new(base, cache_dir.join(origin))?.with_origin(origin);
+    let key = read_signing_key(RPM_SIGNING_KEY_ENV)?;
+    let index = fetcher.sync_db(key.as_deref())?;
+    let downloaded = match key.as_deref() {
+        Some(key) => fetcher.download(&index, name, version, SigCheck::Key(key))?,
+        None => {
+            tracing::warn!(
+                origin = %origin,
+                "no RPM release key configured; {RPM_SIGNING_KEY_ENV} is unset, \
+                 so the package is only hash-checked"
+            );
+            fetcher.download(&index, name, version, SigCheck::Skip)?
+        }
+    };
+    Ok(downloaded.path)
 }
 
 /// Outcome of a single mirror request; keeps "not found" distinct from
@@ -1092,6 +1496,73 @@ mod tests {
         );
         let dest = cache.join("htop.pkg.tar.zst");
         assert_eq!(part_path(&dest), cache.join("htop.pkg.tar.zst.part"));
+    }
+
+    // ─── Phase 3 fetcher dispatch (PLAN 3.2.6 / 3.3.4 / 3.4.5) ──
+
+    #[test]
+    fn test_fetcher_env_var_naming() {
+        assert_eq!(fetcher_env_var("archlinux"), "EXTOS_FETCHER_ARCHLINUX");
+        assert_eq!(fetcher_env_var("rpm"), "EXTOS_FETCHER_RPM");
+        assert_eq!(
+            fetcher_env_var("shadichy-labs.os"),
+            "EXTOS_FETCHER_SHADICHY_LABS_OS"
+        );
+    }
+
+    #[test]
+    fn test_fetcher_kind_parse_accepts_documented_values() {
+        assert_eq!(FetcherKind::parse("").unwrap(), FetcherKind::Http);
+        assert_eq!(FetcherKind::parse("http").unwrap(), FetcherKind::Http);
+        assert_eq!(FetcherKind::parse(" HTTP ").unwrap(), FetcherKind::Http);
+        assert_eq!(FetcherKind::parse("alpm").unwrap(), FetcherKind::Alpm);
+        assert_eq!(FetcherKind::parse("Debian").unwrap(), FetcherKind::Debian);
+        assert_eq!(FetcherKind::parse("RPM").unwrap(), FetcherKind::Rpm);
+        assert_eq!(FetcherKind::Http.as_str(), "http");
+        assert_eq!(FetcherKind::Alpm.as_str(), "alpm");
+        assert_eq!(FetcherKind::Debian.as_str(), "debian");
+        assert_eq!(FetcherKind::Rpm.as_str(), "rpm");
+        for value in FetcherKind::ACCEPTED {
+            assert!(FetcherKind::parse(value).is_ok(), "{value}");
+        }
+    }
+
+    #[test]
+    fn test_fetcher_kind_unknown_value_is_typed_error() {
+        let err = FetcherKind::parse("wget").unwrap_err();
+        assert!(matches!(err, ExtosError::ConfigParse { .. }), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("unknown fetcher 'wget'"), "{message}");
+        assert!(message.contains("http, alpm, debian, rpm"), "{message}");
+    }
+
+    #[test]
+    fn test_fetcher_lookup_defaults_to_http_when_unset() {
+        let kind = fetcher_from_lookup("archlinux", |_| None).unwrap();
+        assert_eq!(kind, FetcherKind::Http);
+        let kind = fetcher_from_lookup("archlinux", |_| Some(String::new())).unwrap();
+        assert_eq!(kind, FetcherKind::Http);
+    }
+
+    #[test]
+    fn test_fetcher_lookup_reads_origin_scoped_variable_only() {
+        let kind = fetcher_from_lookup("shadichy-labs", |key| {
+            (key == "EXTOS_FETCHER_SHADICHY_LABS").then(|| "alpm".to_string())
+        })
+        .unwrap();
+        assert_eq!(kind, FetcherKind::Alpm);
+    }
+
+    #[test]
+    fn test_fetcher_lookup_error_names_the_origin_variable() {
+        let err = fetcher_from_lookup("shadichy-labs", |_| Some("apt".to_string())).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("EXTOS_FETCHER_SHADICHY_LABS"),
+            "error must name the env var: {message}"
+        );
+        assert!(message.contains("origin 'shadichy-labs'"), "{message}");
+        assert!(message.contains("unknown fetcher 'apt'"), "{message}");
     }
 
     #[test]
