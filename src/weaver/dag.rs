@@ -73,6 +73,19 @@ impl DepGraph {
         self.index.get(key).copied()
     }
 
+    /// Look up a node by exact `origin/name/version` (PLAN 5.2.3).
+    ///
+    /// [`DepGraph::find`] keys on `origin/name` — the graph holds one node per
+    /// package, so a lookup cannot distinguish "already planned at exactly this
+    /// version" from "planned at another version". Capability promotion needs
+    /// that distinction: the first case is a silent dedup hit, the second is a
+    /// skip worth warning about. This accessor adds no state and leaves the
+    /// private index layout untouched.
+    pub fn find_exact(&self, origin: &str, name: &str, version: &str) -> Option<usize> {
+        let idx = self.find(&format!("{origin}/{name}"))?;
+        (self.nodes.get(idx)?.identity.version == version).then_some(idx)
+    }
+
     /// Look up a node by index.
     pub fn get(&self, idx: usize) -> Option<&DagNode> {
         self.nodes.get(idx)
@@ -497,5 +510,15 @@ mod tests {
         assert_eq!(g.find("arch/htop"), Some(0));
         assert_eq!(g.find("debian/vim"), Some(1));
         assert_eq!(g.find("arch/vim"), None);
+    }
+
+    #[test]
+    fn test_find_exact_distinguishes_versions() {
+        let mut g = DepGraph::new();
+        g.insert(mock_node("arch", "htop", vec![]));
+
+        assert_eq!(g.find_exact("arch", "htop", "1.0"), Some(0));
+        assert_eq!(g.find_exact("arch", "htop", "2.0"), None);
+        assert_eq!(g.find_exact("arch", "missing", "1.0"), None);
     }
 }

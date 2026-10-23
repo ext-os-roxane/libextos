@@ -25,6 +25,12 @@ use crate::types::HashAlgorithm;
 /// Maximum symlink chain depth before reporting ELOOP.
 const MAX_SYMLINK_DEPTH: usize = 40;
 
+/// Longest accepted virtual anchor name (`refs/virtual/<name>`, PLAN 5.1.2).
+///
+/// Mirrors [`crate::appdir::MAX_APP_ID_LEN`]: both are single path components
+/// used as directory/file names, so the same length budget applies.
+pub const MAX_VIRTUAL_NAME_LEN: usize = 64;
+
 // ─── Hash Computation ───────────────────────────────────────────
 
 /// Compute a content hash over raw bytes, prefixed with algorithm tag.
@@ -403,6 +409,185 @@ impl CasRepository {
         fs::write(&ref_link, target.to_string_lossy().as_bytes())?;
 
         Ok(())
+    }
+
+    // ── Virtual anchor links (PLAN 5.1.2) ──
+
+    /// Path of a virtual anchor link: `refs/virtual/<name>`.
+    ///
+    /// Unlike the per-version [`CasRepository::create_virtual_ref`] layout
+    /// (`refs/virtual/<alias>/<ver>`), this is a *single* alternatives-style
+    /// pointer from a virtual name (a SONAME, typically) to the concrete ref
+    /// that currently anchors it. `name` is validated by
+    /// [`validate_virtual_name`] when a link is created or resolved.
+    pub fn virtual_ref_path(&self, name: &str) -> PathBuf {
+        self.root.join("refs").join("virtual").join(name)
+    }
+
+    /// Point `refs/virtual/<name>` at the concrete ref
+    /// `refs/<origin>/<package>/<version>` (PLAN 5.1.2).
+    ///
+    /// The link is *relative* (`../<origin>/<package>/<version>`) so the
+    /// repository root stays relocatable, and it therefore always resolves
+    /// inside `refs/` of the same repository — the target safety invariant is
+    /// structural, not a policy check. The concrete ref must exist and resolve
+    /// to a stored object; otherwise [`ExtosError::PackageNotFound`] is
+    /// returned. A directory already occupying the link path is refused with
+    /// [`ExtosError::CasIntegrity`] rather than deleted.
+    ///
+    /// # Idempotency
+    ///
+    /// Returns `Ok(false)` when the existing link already carries exactly the
+    /// requested target (content comparison of the link text, not of mtimes),
+    /// `Ok(true)` when a link was created or retargeted. Retargeting is atomic:
+    /// the new link is created under a temporary name in the same directory and
+    /// renamed over the old one.
+    ///
+    /// # Hostile names
+    ///
+    /// `name` must be a valid virtual name ([`validate_virtual_name`]);
+    /// `origin`, `package` and `version` must be single path components. This
+    /// keeps every generated link inside the repository tree.
+    /// # Layout note (existing accessors)
+    ///
+    /// This link lives directly under `refs/virtual/`, so it points at a
+    /// directory and the *existing* `list_origins`/`list_packages` walk (which
+    /// follows symlinks via `Path::is_dir`) also sees it as the pseudo-package
+    /// `virtual/<name>`. `list_versions` then reads the object directory it
+    /// resolves to, so [`CasRepository::list_refs`] reports cosmetic
+    /// `virtual/<name>/{content,metadata}` rows. The behaviour of those
+    /// Phase-2 functions is deliberately left untouched (PLAN 5.1.2 is additive);
+    /// consumers that care should use [`CasRepository::resolve_virtual`] and
+    /// [`CasRepository::resolve_virtual_object`] instead, and per-version
+    /// virtual aliases keep using [`CasRepository::create_virtual_ref`].
+    pub fn create_virtual_link(
+        &self,
+        name: &str,
+        origin: &str,
+        package: &str,
+        version: &str,
+    ) -> Result<bool, ExtosError> {
+        validate_virtual_name(name)?;
+        validate_ref_component(origin, "origin")?;
+        validate_ref_component(package, "package")?;
+        validate_ref_component(version, "version")?;
+
+        // The concrete ref must name a live object, not a dangling row.
+        let _ = self.resolve_ref(origin, package, version)?;
+
+        let link = self.virtual_ref_path(name);
+        let target = PathBuf::from("..")
+            .join(origin)
+            .join(package)
+            .join(version);
+
+        if let Ok(metadata) = fs::symlink_metadata(&link) {
+            if metadata.file_type().is_symlink() {
+                if fs::read_link(&link)? == target {
+                    return Ok(false);
+                }
+            } else if metadata.is_dir() {
+                return Err(ExtosError::CasIntegrity {
+                    expected: format!("a virtual ref symlink at {}", link.display()),
+                    actual: "an existing directory".into(),
+                });
+            }
+        }
+
+        if let Some(parent) = link.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = link.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+        if tmp.symlink_metadata().is_ok() {
+            fs::remove_file(&tmp)?;
+        }
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &tmp)?;
+        #[cfg(not(unix))]
+        fs::write(&tmp, target.to_string_lossy().as_bytes())?;
+
+        if let Err(error) = fs::rename(&tmp, &link) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+        Ok(true)
+    }
+
+    /// Resolve a virtual anchor link back to the concrete ref it names
+    /// (PLAN 5.1.2).
+    ///
+    /// Reads `refs/virtual/<name>` (one hop, no chain following: the link is a
+    /// direct pointer to `refs/<origin>/<package>/<version>`), requires the
+    /// link text to be the relative `../<origin>/<package>/<version>` form, and
+    /// verifies that the concrete ref still resolves to an object. Absolute
+    /// targets and targets that leave `refs/` are rejected with
+    /// [`ExtosError::CasIntegrity`], as is a missing link
+    /// ([`ExtosError::PackageNotFound`] for `virtual/<name>`).
+    ///
+    /// This is deliberately additive: [`CasRepository::resolve_ref`] keeps its
+    /// exact Phase-2 behaviour, so existing callers cannot change meaning.
+    pub fn resolve_virtual(&self, name: &str) -> Result<RefEntry, ExtosError> {
+        validate_virtual_name(name)?;
+        let link = self.virtual_ref_path(name);
+        let metadata = fs::symlink_metadata(&link).map_err(|_| ExtosError::PackageNotFound {
+            origin: "virtual".into(),
+            name: name.to_string(),
+            version: "current".into(),
+        })?;
+        if !metadata.file_type().is_symlink() {
+            return Err(ExtosError::CasIntegrity {
+                expected: format!("a virtual ref symlink at {}", link.display()),
+                actual: "not a symlink".into(),
+            });
+        }
+
+        let target = fs::read_link(&link)?;
+        if target.is_absolute() {
+            return Err(ExtosError::CasIntegrity {
+                expected: "a relative virtual ref target".into(),
+                actual: target.display().to_string(),
+            });
+        }
+        let components: Vec<String> = target
+            .iter()
+            .map(|part| part.to_string_lossy().to_string())
+            .collect();
+        let [parent, origin, package, version] = components.as_slice() else {
+            return Err(ExtosError::CasIntegrity {
+                expected: "../<origin>/<package>/<version>".into(),
+                actual: target.display().to_string(),
+            });
+        };
+        if parent != ".." {
+            return Err(ExtosError::CasIntegrity {
+                expected: "../<origin>/<package>/<version>".into(),
+                actual: target.display().to_string(),
+            });
+        }
+        validate_ref_component(origin, "origin")?;
+        validate_ref_component(package, "package")?;
+        validate_ref_component(version, "version")?;
+
+        // The pointer must land on a live concrete ref, not a stale row.
+        let _ = self.resolve_ref(origin, package, version)?;
+
+        Ok(RefEntry {
+            origin: origin.clone(),
+            name: package.clone(),
+            version: version.clone(),
+        })
+    }
+
+    /// Resolve a virtual anchor link to `(concrete ref, object id)`.
+    ///
+    /// Convenience composition of [`CasRepository::resolve_virtual`] and
+    /// [`CasRepository::resolve_ref`]; the object id is the one already named
+    /// by the concrete ref (no digest is recomputed).
+    pub fn resolve_virtual_object(&self, name: &str) -> Result<(RefEntry, String), ExtosError> {
+        let entry = self.resolve_virtual(name)?;
+        let object = self.resolve_ref(&entry.origin, &entry.name, &entry.version)?;
+        Ok((entry, object))
     }
 
     // ── Lockfile ──
@@ -878,6 +1063,62 @@ fn segment_glob(text: &[u8], pattern: &[u8]) -> bool {
     }
 }
 
+// ─── Ref Component Validation ───────────────────────────────────
+
+/// Whether `name` is an acceptable virtual anchor name (PLAN 5.1.2).
+///
+/// The accepted set is exactly the one [`crate::appdir::normalize_app_id`]
+/// enforces for AppDir ids — non-empty, at most [`MAX_VIRTUAL_NAME_LEN`]
+/// bytes, ASCII alphanumerics plus `.`, `_`, `+`, `-`, and never starting with
+/// `.` or `-` — with one deliberate difference: case is **preserved**, because
+/// a SONAME such as `libSSL.so.3` is case-sensitive on the filesystem. (That is
+/// also why the AppDir normalizer itself is not called: it lowercases.)
+/// Separators, `..`, NUL and every other byte are rejected.
+pub fn is_valid_virtual_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_VIRTUAL_NAME_LEN {
+        return false;
+    }
+    if name.starts_with('.') || name.starts_with('-') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// Validate a virtual anchor name, with a typed error naming the offender.
+pub fn validate_virtual_name(name: &str) -> Result<(), ExtosError> {
+    if is_valid_virtual_name(name) {
+        return Ok(());
+    }
+    Err(ExtosError::Weave(format!(
+        "invalid virtual anchor name {name:?}: expected 1..={MAX_VIRTUAL_NAME_LEN} bytes of \
+         [A-Za-z0-9._+-], not starting with '.' or '-'"
+    )))
+}
+
+/// Validate one ref path component (`origin`, package name or version).
+///
+/// Ref components come from upstream package metadata, so the accepted set is
+/// wider than an identifier: anything is allowed except path separators, NUL,
+/// the `.`/`..` segments and the empty string. That is precisely the set that
+/// cannot escape `refs/`.
+pub fn validate_ref_component(value: &str, what: &str) -> Result<(), ExtosError> {
+    if value.is_empty() {
+        return Err(ExtosError::Weave(format!("{what} must not be empty")));
+    }
+    if value == "." || value == ".." {
+        return Err(ExtosError::Weave(format!(
+            "{what} {value:?} is a path segment, not a ref component"
+        )));
+    }
+    if value.contains('/') || value.contains('\\') || value.contains('\0') {
+        return Err(ExtosError::Weave(format!(
+            "{what} {value:?} contains a path separator or NUL"
+        )));
+    }
+    Ok(())
+}
+
 // ─── Helpers ────────────────────────────────────────────────────
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ExtosError> {
@@ -1293,5 +1534,203 @@ mod tests {
         assert!(!repo.object_path(&orphan).exists());
         // The dangling `current` symlink is left untouched (GC owns objects, not refs).
         assert!(repo.ref_path("archlinux", "mesa", "current").symlink_metadata().is_ok());
+    }
+
+    // ── PLAN 5.1.2: virtual anchor links ──
+
+    fn virtual_world() -> (tempfile::TempDir, CasRepository, String, String) {
+        let (dir, repo) = tmp_repo();
+        let arch = repo.store_bytes(b"arch openssl").unwrap();
+        let fedora = repo.store_bytes(b"fedora openssl").unwrap();
+        repo.create_ref("archlinux", "openssl", "3.3.1", &arch).unwrap();
+        repo.create_ref("fedora", "openssl", "3.0.11", &fedora).unwrap();
+        (dir, repo, arch, fedora)
+    }
+
+    #[test]
+    fn test_virtual_link_creates_relative_pointer_and_resolves() {
+        let (_dir, repo, _arch, fedora) = virtual_world();
+        let created = repo
+            .create_virtual_link("libssl.so.3", "fedora", "openssl", "3.0.11")
+            .unwrap();
+        assert!(created);
+
+        let link = repo.virtual_ref_path("libssl.so.3");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        // Relative, one hop up out of refs/virtual/ and no object paths.
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            PathBuf::from("../fedora/openssl/3.0.11")
+        );
+        // Stays inside the repository tree.
+        let root = fs::canonicalize(&repo.root).unwrap();
+        assert!(fs::canonicalize(&link).unwrap().starts_with(&root));
+
+        assert_eq!(
+            repo.resolve_virtual("libssl.so.3").unwrap(),
+            RefEntry {
+                origin: "fedora".into(),
+                name: "openssl".into(),
+                version: "3.0.11".into(),
+            }
+        );
+        let (entry, object) = repo.resolve_virtual_object("libssl.so.3").unwrap();
+        assert_eq!(entry.origin, "fedora");
+        assert_eq!(object, fedora);
+        assert_eq!(
+            repo.resolve_ref(&entry.origin, &entry.name, &entry.version).unwrap(),
+            fedora
+        );
+    }
+
+    #[test]
+    fn test_virtual_link_is_idempotent_and_retargets_atomically() {
+        let (_dir, repo, arch, _fedora) = virtual_world();
+        assert!(
+            repo.create_virtual_link("libssl.so.3", "fedora", "openssl", "3.0.11")
+                .unwrap()
+        );
+        // Same target: content-compare no-op, even though the link is re-created.
+        assert!(
+            !repo
+                .create_virtual_link("libssl.so.3", "fedora", "openssl", "3.0.11")
+                .unwrap()
+        );
+        // Different target: retargeted, never left dangling in between.
+        assert!(
+            repo.create_virtual_link("libssl.so.3", "archlinux", "openssl", "3.3.1")
+                .unwrap()
+        );
+        assert_eq!(
+            repo.resolve_virtual_object("libssl.so.3").unwrap().1,
+            arch
+        );
+        // No temporary links left behind.
+        let leftovers: Vec<_> = fs::read_dir(repo.root.join("refs").join("virtual"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn test_virtual_link_rejects_hostile_names_and_existing_directories() {
+        let (_dir, repo, _arch, _fedora) = virtual_world();
+        for name in ["", ".", "..", "../evil", "a/b", "a b", "\\x", "-x"] {
+            let err = repo
+                .create_virtual_link(name, "fedora", "openssl", "3.0.11")
+                .unwrap_err();
+            assert!(matches!(err, ExtosError::Weave(_)), "{name:?} -> {err}");
+        }
+        // A ref component may not smuggle a path separator either.
+        assert!(
+            repo.create_virtual_link("ok.so", "..", "openssl", "3.0.11")
+                .is_err()
+        );
+        // A real directory at the link path is refused, never deleted.
+        let occupied = repo.virtual_ref_path("libssl.so.3");
+        fs::create_dir_all(&occupied).unwrap();
+        let err = repo
+            .create_virtual_link("libssl.so.3", "fedora", "openssl", "3.0.11")
+            .unwrap_err();
+        assert!(matches!(err, ExtosError::CasIntegrity { .. }), "{err}");
+        assert!(occupied.is_dir());
+    }
+
+    #[test]
+    fn test_virtual_link_requires_a_live_concrete_ref() {
+        let (_dir, repo, _arch, _fedora) = virtual_world();
+        let err = repo
+            .create_virtual_link("libssl.so.3", "fedora", "openssl", "9.9.9")
+            .unwrap_err();
+        assert!(matches!(err, ExtosError::PackageNotFound { .. }), "{err}");
+        assert!(repo.virtual_ref_path("libssl.so.3").symlink_metadata().is_err());
+
+        // Missing virtual / non-symlink link are typed errors, not panics.
+        assert!(matches!(
+            repo.resolve_virtual("libssl.so.3").unwrap_err(),
+            ExtosError::PackageNotFound { .. }
+        ));
+        fs::create_dir_all(repo.virtual_ref_path("plain.so")).unwrap();
+        assert!(matches!(
+            repo.resolve_virtual("plain.so").unwrap_err(),
+            ExtosError::CasIntegrity { .. }
+        ));
+    }
+
+    #[test]
+    fn test_resolve_virtual_rejects_absolute_and_malformed_targets() {
+        let (_dir, repo, arch, _fedora) = virtual_world();
+        let link = repo.virtual_ref_path("evil.so");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let absolute = repo.object_path(&arch);
+        std::os::unix::fs::symlink(&absolute, &link).unwrap();
+        assert!(matches!(
+            repo.resolve_virtual("evil.so").unwrap_err(),
+            ExtosError::CasIntegrity { .. }
+        ));
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("../../archlinux/openssl/3.3.1", &link).unwrap();
+        assert!(matches!(
+            repo.resolve_virtual("evil.so").unwrap_err(),
+            ExtosError::CasIntegrity { .. }
+        ));
+    }
+
+    #[test]
+    fn test_virtual_link_keeps_its_object_live_for_gc() {
+        let (_dir, repo, _arch, fedora) = virtual_world();
+        repo.create_virtual_link("libssl.so.3", "fedora", "openssl", "3.0.11")
+            .unwrap();
+        // The virtual link is the only reference to fedora's object; GC must
+        // still see it through the link chain and keep the object.
+        assert!(repo.garbage_collect().unwrap().is_empty());
+        assert!(repo.object_path(&fedora).exists());
+        assert_eq!(repo.resolve_virtual_object("libssl.so.3").unwrap().1, fedora);
+    }
+
+    #[test]
+    fn test_virtual_link_is_visible_to_the_existing_listing_apis() {
+        // Documents (and pins) the interaction noted on
+        // `create_virtual_link`: because `list_packages` follows symlinks, the
+        // single link also appears as the pseudo-package `virtual/<name>`.
+        // Nothing in the Phase-5 pipeline consumes those rows, and
+        // `resolve_virtual`/`resolve_virtual_object` are the supported readers.
+        let (_dir, repo, _arch, _fedora) = virtual_world();
+        repo.create_virtual_link("libssl.so.3", "fedora", "openssl", "3.0.11")
+            .unwrap();
+        let rows = repo.list_refs().unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| matches!(row.origin.as_str(), "fedora" | "archlinux" | "virtual"))
+        );
+        assert!(rows.iter().any(|row| {
+            row.origin == "virtual" && row.name == "libssl.so.3" && row.version == "content"
+        }));
+        // search_files skips them (they resolve to no CAS object) instead of
+        // failing the whole search.
+        assert!(repo.search_files("libssl").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_virtual_name_rules() {
+        assert!(is_valid_virtual_name("libssl.so.3"));
+        assert!(is_valid_virtual_name("libc.so.6"));
+        assert!(is_valid_virtual_name("libstdc++.so.6"));
+        assert!(is_valid_virtual_name("LibSSL.so.3"));
+        assert!(!is_valid_virtual_name(""));
+        assert!(!is_valid_virtual_name("."));
+        assert!(!is_valid_virtual_name(".."));
+        assert!(!is_valid_virtual_name("../x"));
+        assert!(!is_valid_virtual_name("a/b"));
+        assert!(!is_valid_virtual_name("-a"));
+        assert!(!is_valid_virtual_name(&"x".repeat(MAX_VIRTUAL_NAME_LEN + 1)));
+        assert!(is_valid_virtual_name(&"x".repeat(MAX_VIRTUAL_NAME_LEN)));
+        assert!(validate_ref_component("9.1.0-1", "version").is_ok());
+        assert!(validate_ref_component("1:2.3", "version").is_ok());
+        assert!(validate_ref_component("", "version").is_err());
+        assert!(validate_ref_component("..", "version").is_err());
+        assert!(validate_ref_component("a/b", "version").is_err());
     }
 }

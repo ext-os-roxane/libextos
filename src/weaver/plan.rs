@@ -17,10 +17,14 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::anchor::{AnchorBid, AnchorPolicy, AnchorTable};
+use crate::caps::CapabilityIndex as CasCapabilityIndex;
 use crate::cas::{hash_bytes, CasRepository, RefEntry};
 use crate::config;
+use crate::dependency::{
+    resolve_capability, CapabilityCandidate, CapabilityRequest, CapabilitySource, DependencySpec,
+};
 use crate::error::ExtosError;
-use crate::manifest::{PackageIdentity, PackageManifest};
+use crate::manifest::{Capabilities, PackageIdentity, PackageManifest};
 use crate::weaver::collision::{CollisionResolution, OriginPriority, ResolvedCollision};
 use crate::weaver::dag::{DagNode, DepGraph};
 use crate::weaver::link::{link_hardlink, link_reflink, link_symlink, LinkStrategy};
@@ -169,6 +173,7 @@ pub struct VfsPlan {
     strategy: LinkStrategy,
     warnings: Vec<String>,
     anchors: AnchorTable,
+    promoted: Vec<CapabilityCandidate>,
 }
 
 impl Default for VfsPlan {
@@ -179,6 +184,7 @@ impl Default for VfsPlan {
             strategy: LinkStrategy::Symlink,
             warnings: Vec::new(),
             anchors: AnchorTable::empty(),
+            promoted: Vec::new(),
         }
     }
 }
@@ -211,6 +217,18 @@ impl VfsPlan {
     /// winner is the provider that owns that SONAME in the woven tree.
     pub fn anchors(&self) -> &AnchorTable {
         &self.anchors
+    }
+
+    /// Capability-index packages that were promoted into this plan (PLAN 5.2.3).
+    ///
+    /// Only populated by
+    /// [`plan_from_refs_with_anchors_and_index`]; the delegated anchor entry
+    /// point always reports an empty slice. Each candidate's
+    /// [`object`](crate::dependency::CapabilityCandidate::object) is the CAS hash
+    /// that was woven, in deterministic promotion order (one entry per promoted
+    /// `origin/name`, never a duplicate).
+    pub fn promoted(&self) -> &[CapabilityCandidate] {
+        &self.promoted
     }
 
     /// Replace the file link strategy (consuming builder form).
@@ -390,12 +408,76 @@ pub fn plan_from_refs_with(
 /// the conflict is recorded as the usual [`CollisionResolution::PriorityWin`]
 /// with an explanatory warning. A library deployed by only one package is
 /// anchored to that package without a collision.
+///
+/// This is the no-index path: it delegates to
+/// [`plan_from_refs_with_anchors_and_index`] with `index = None`, so existing
+/// callers (`instanz::orchestrate`) keep byte-identical behaviour and never
+/// promote a CAS-wide capability (PLAN 5.2.3).
 pub fn plan_from_refs_with_anchors(
     repo: &CasRepository,
     refs: &[CasRef],
     strategy: LinkStrategy,
     priority: &OriginPriority,
     anchor_policy: &AnchorPolicy,
+) -> Result<VfsPlan, ExtosError> {
+    plan_from_refs_with_anchors_and_index(
+        repo,
+        refs,
+        strategy,
+        priority,
+        anchor_policy,
+        None,
+    )
+}
+
+/// Plan with an optional CAS capability index (PLAN 5.2.3 consumer).
+///
+/// Exactly [`plan_from_refs_with_anchors`], plus capability-index expansion:
+/// after the graph is built from `refs` and before dependency linking, every
+/// unsatisfied [`CapabilityRequest`] whose
+/// provider is not already in the plan is looked up in `index`. The best-ranked
+/// index hit (see [`CasCapabilityIndex`]'s ordering) is **promoted** into the
+/// graph as a real `DagNode` carrying the provider's CAS object hash, so the
+/// promoted package is resolved, topologically sorted, woven into the virtual
+/// FHS and collision-resolved like any other planned package. Promotion repeats
+/// until a fixpoint, so a promoted package's own capability requirements are
+/// satisfied the same way.
+///
+/// # Safety of promotion (ordering law)
+///
+/// Promotion happens strictly **before** [`VirtualFhs::build`], anchor bidding
+/// and collision resolution. An index hit therefore never decides a roof
+/// collision on its own: it only adds a bidder, and the anchor policy is
+/// re-derived over the final node set (see [`resolve_capability`]). The library
+/// file of a promoted provider is present in the woven tree exactly because the
+/// promoted node existed before the VFS matrix was built.
+///
+/// # Precedence and termination
+///
+/// In-plan providers always outrank the index: a request satisfied by a planned
+/// package never promotes anything. Each pass either adds at least one new
+/// `origin/name` or stops, so the loop terminates; the pass count is
+/// additionally capped by `MAX_CAPABILITY_EXPANSION_PASSES`, and exceeding it
+/// is a typed [`ExtosError::Weave`] instead of a hang. A dependency cycle among
+/// promoted packages surfaces from [`DepGraph::toposort`] as the usual typed
+/// cycle error.
+///
+/// Promotions are reported through [`VfsPlan::promoted`] and as
+/// `promoted <origin>/<name> <version> from the capability index for <soname>`
+/// warnings. Non-SONAME requests (executable/resource/virtual) are unaffected:
+/// the index covers SONAMEs only.
+///
+/// # Errors
+///
+/// Everything [`plan_from_refs_with_anchors`] errors on, plus the bounded
+/// expansion failure described above.
+pub fn plan_from_refs_with_anchors_and_index(
+    repo: &CasRepository,
+    refs: &[CasRef],
+    strategy: LinkStrategy,
+    priority: &OriginPriority,
+    anchor_policy: &AnchorPolicy,
+    index: Option<&CasCapabilityIndex>,
 ) -> Result<VfsPlan, ExtosError> {
     if refs.is_empty() {
         return Ok(VfsPlan::default().with_strategy(strategy));
@@ -435,6 +517,17 @@ pub fn plan_from_refs_with_anchors(
             deps: Vec::new(),
             requires: manifest.requires.clone(),
         });
+    }
+
+    // PLAN 5.2.3: promote capability-index providers into the graph *before*
+    // dependency linking, topological sorting and — crucially — before the
+    // virtual FHS / anchor stage so their payloads exist at the roof.
+    let mut promoted: Vec<CapabilityCandidate> = Vec::new();
+    if let Some(index) = index {
+        let (promoted_nodes, expansion_warnings) =
+            expand_capabilities_from_index(repo, &mut graph, index)?;
+        promoted.extend(promoted_nodes);
+        warnings.extend(expansion_warnings);
     }
 
     // Phase 2: turn `requires` into dependency indices, then topologically sort.
@@ -525,7 +618,231 @@ pub fn plan_from_refs_with_anchors(
         strategy,
         warnings,
         anchors,
+        promoted,
     })
+}
+
+/// Hard ceiling on capability-index expansion passes (PLAN 5.2.3).
+///
+/// A pass either inserts at least one previously unseen provider or stops, so
+/// the natural bound is the number of distinct index providers. This constant is
+/// a defensive ceiling on top of that: a bug can turn into a typed error, never
+/// an unbounded loop.
+const MAX_CAPABILITY_EXPANSION_PASSES: usize = 4096;
+
+/// Key a capability request uses in promotion warnings: the bare SONAME for
+/// [`CapabilityRequest::Provides`], the [`Display`](std::fmt::Display) form
+/// otherwise.
+fn request_key(request: &CapabilityRequest) -> String {
+    match request {
+        CapabilityRequest::Provides(soname) => soname.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Promote index-resolved capabilities into `graph` until fixpoint (PLAN 5.2.3).
+///
+/// Algorithm (one *pass* per iteration):
+///
+/// 1. Snapshot the current node set as in-plan [`CapabilityCandidate`]s
+///    (`source = Plan`, carrying `node.hash` as the object).
+/// 2. For every node's every `Capability` requirement, call
+///    [`resolve_capability`] with that snapshot and the index. A resolution with
+///    `source == Plan` means the plan already satisfies it — nothing happens.
+///    A resolution with `source == CapabilityIndex` contributes its best-ranked
+///    provider (`.winner()`), deduplicated by provider label (`origin/name`,
+///    the graph's key) so several requests never promote the same package twice.
+/// 3. Insert each winner as a real [`DagNode`]:
+///    * `hash` = the provider's **CAS object** (never a re-resolved ref),
+///    * identity `version` = the provider's human-readable version,
+///    * `capabilities.libraries` = the index's `provides` (the manifest is
+///      re-read only to fan out the promoted package's own `requires` and its
+///      non-library capability blocks),
+///    * `requires` = the manifest's requirements, so the next pass can promote
+///      *their* providers (`capabilities` and the loop fan-out are one action).
+///    A provider whose label is already in the graph is never re-inserted:
+///    [`DepGraph::insert`] would silently overwrite the `origin/name` index entry
+///    while appending a duplicate node, so dedup happens *before* the call.
+/// 4. Stop when a pass finds no index hit, or when a pass inserts nothing (all
+///    hits already planned / missing objects). Otherwise repeat.
+///
+/// # Errors
+///
+/// [`ExtosError::Weave`] if the pass ceiling is exceeded (unreachable with
+/// correct inputs; guards against a logic regression). Manifest read/parse
+/// failures on a promoted row are non-fatal: the row is skipped with a warning,
+/// matching the index's "one corrupt package never fails the repository"
+/// contract.
+fn expand_capabilities_from_index(
+    repo: &CasRepository,
+    graph: &mut DepGraph,
+    index: &CasCapabilityIndex,
+) -> Result<(Vec<CapabilityCandidate>, Vec<String>), ExtosError> {
+    let mut promoted: Vec<CapabilityCandidate> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let max_passes = graph
+        .len()
+        .saturating_add(index.provider_refs().len())
+        .saturating_add(1)
+        .min(MAX_CAPABILITY_EXPANSION_PASSES);
+    let mut converged = false;
+
+    for _pass in 0..max_passes {
+        // 1. In-plan snapshot. `node.hash` is the object a promotion would need
+        //    to weave; candidates only feed `resolve_capability`'s filter.
+        let in_plan: Vec<CapabilityCandidate> = graph
+            .nodes
+            .iter()
+            .map(|node| {
+                CapabilityCandidate::from_plan(
+                    node.identity.origin.clone(),
+                    node.identity.name.clone(),
+                    node.identity.version.clone(),
+                    Some(node.hash.clone()),
+                    node.capabilities.clone(),
+                )
+            })
+            .collect();
+
+        // 2. Best index hit per provider label. The BTreeMap gives deterministic
+        //    (label-ascending) promotion order across runs.
+        let mut winners: BTreeMap<String, (CapabilityRequest, CapabilityCandidate)> =
+            BTreeMap::new();
+        for node in &graph.nodes {
+            for dep in &node.requires {
+                let DependencySpec::Capability(request) = dep else {
+                    continue;
+                };
+                let resolution = resolve_capability(request, &in_plan, Some(index));
+                if resolution.source != Some(CapabilitySource::CapabilityIndex) {
+                    continue;
+                }
+                let Some(winner) = resolution.winner() else {
+                    continue;
+                };
+                winners
+                    .entry(winner.label())
+                    .or_insert_with(|| (request.clone(), winner.clone()));
+            }
+        }
+
+        if winners.is_empty() {
+            converged = true;
+            break;
+        }
+
+        let mut inserted_this_pass = 0usize;
+        for (_label, (request, winner)) in winners {
+            let label = winner.label();
+
+            // 3 (dedup law). Never insert a second node for one `origin/name`:
+            // `DepGraph::insert` overwrites the index key but appends a node,
+            // which would duplicate payload claims in the VFS.
+            if graph
+                .find_exact(&winner.origin, &winner.name, &winner.version)
+                .is_some()
+            {
+                // Exactly this provider is already planned (it simply does not
+                // advertise the request, e.g. stale-index metadata).
+                continue;
+            }
+            if let Some(existing_idx) = graph.find(&label) {
+                let existing = &graph.nodes[existing_idx];
+                warnings.push(format!(
+                    "capability promotion skipped: {label} is already planned at {} but the \
+                     capability index offers {} for {}",
+                    existing.identity.version,
+                    winner.version,
+                    request_key(&request)
+                ));
+                continue;
+            }
+
+            let Some(object) = winner.object.clone() else {
+                warnings.push(format!(
+                    "capability promotion skipped: {label} has no CAS object for {}",
+                    request_key(&request)
+                ));
+                continue;
+            };
+
+            // Re-read the manifest so the promoted node participates in the
+            // dependency graph exactly like a user-selected ref.
+            let manifest_nix = match repo.read_manifest(&object) {
+                Ok(text) => text,
+                Err(err) => {
+                    warnings.push(format!(
+                        "capability promotion skipped for {label}: manifest unreadable for \
+                         object {object}: {err}"
+                    ));
+                    continue;
+                }
+            };
+            let value = match config::parse_nix(&manifest_nix) {
+                Ok(value) => value,
+                Err(err) => {
+                    warnings.push(format!(
+                        "capability promotion skipped for {label}: manifest does not parse: {err}"
+                    ));
+                    continue;
+                }
+            };
+            let manifest = match PackageManifest::from_nix(&value) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    warnings.push(format!(
+                        "capability promotion skipped for {label}: manifest is not a valid \
+                         package manifest: {err}"
+                    ));
+                    continue;
+                }
+            };
+
+            // The index's `provides` is authoritative for the library keys that
+            // triggered the promotion; the manifest supplies every other
+            // capability block. No aliases: inserting them could shadow a
+            // user-selected node's index key.
+            let capabilities = Capabilities {
+                libraries: winner.capabilities.libraries.clone(),
+                ..manifest.capabilities.clone()
+            };
+
+            graph.insert(DagNode {
+                hash: object,
+                identity: PackageIdentity {
+                    origin: winner.origin.clone(),
+                    name: winner.name.clone(),
+                    version: winner.version.clone(),
+                    aliases: Vec::new(),
+                },
+                capabilities,
+                deps: Vec::new(),
+                requires: manifest.requires.clone(),
+            });
+            inserted_this_pass += 1;
+            warnings.push(format!(
+                "promoted {label} {} from the capability index for {}",
+                winner.version,
+                request_key(&request)
+            ));
+            promoted.push(winner);
+        }
+
+        if inserted_this_pass == 0 {
+            // Every hit was already planned or unusable; another pass would
+            // recompute the same set.
+            converged = true;
+            break;
+        }
+    }
+
+    if !converged {
+        return Err(ExtosError::Weave(format!(
+            "capability index expansion did not converge after {max_passes} pass(es)"
+        )));
+    }
+
+    Ok((promoted, warnings))
 }
 
 /// Build the SONAME anchor table for a set of resolved packages.

@@ -6,8 +6,10 @@
 //! Rosetta plugin engine, and the Symlink/Reflink Weaver engine.
 
 pub mod anchor;
+pub mod anchors_map;
 pub mod appdir;
 pub mod cas;
+pub mod caps;
 pub mod config;
 pub mod container;
 pub mod dependency;
@@ -23,4 +25,5 @@ pub mod phantom;
 pub mod rosetta;
 pub mod snapshot;
 pub mod types;
+pub mod vlock;
 pub mod weaver;

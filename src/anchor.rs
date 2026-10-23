@@ -29,11 +29,24 @@
 //!
 //! # Scope boundary (Phase 5)
 //!
-//! This module is *in-plan* bidding only: it never reads or writes a `.lock`
-//! file and it has no memory across `instanz apply` runs. Phase 5.1 formalizes
-//! the lockfile that pins these outcomes for reproducibility; until then the
-//! bidding inputs are exactly "the refs being woven + the capabilities their
-//! manifests declare", as required by PLAN 4.1.3.
+//! This module is *in-plan* bidding: it never reads or writes a `.lock` file
+//! and it has no memory across `instanz apply` runs. Phase 5.1 formalizes the
+//! lockfile that pins these outcomes for reproducibility
+//! ([`crate::vlock`]) and adds the declarative `anchors.nix` map
+//! ([`crate::anchors_map`]) that builds the [`AnchorPolicy`] used here; the
+//! ranking rules below stay the single source of truth for both.
+//!
+//! # Policy authority (PLAN 5.1.3, G-L13)
+//!
+//! [`AnchorTable::from_bids`] and [`AnchorTable::resolve`] **apply** the
+//! supplied policy to every bid before ranking it, so the policy argument is
+//! authoritative rather than decorative: a caller can no longer get ranking
+//! that disagrees with the policy it passed. [`AnchorPolicy::apply`] stays
+//! public and idempotent for callers that want the rewritten bids themselves
+//! (the weaver does), and applying twice is a no-op. Consequently a bid's
+//! [`AnchorBid::priority`] field is the value the policy would assign; use
+//! [`AnchorBid::with_priority`] only for ranking outside an [`AnchorTable`]
+//! or when the policy deliberately leaves a provider at its default.
 //!
 //! # Examples
 //!
@@ -83,7 +96,12 @@ pub struct AnchorBid {
     pub version: String,
     /// Path of the library file relative to the roof root.
     pub path: PathBuf,
-    /// Priority: lower wins. Use [`AnchorPolicy::priority_of`] to derive it.
+    /// Priority: lower wins.
+    ///
+    /// [`AnchorPolicy::priority_of`] derives it for a provider. Note that
+    /// [`AnchorTable::from_bids`] and [`AnchorTable::resolve`] re-apply the
+    /// policy they are given (PLAN 5.1.3), overwriting this field; set it on the
+    /// policy when bidding through a table.
     pub priority: u32,
 }
 
@@ -181,6 +199,28 @@ impl AnchorPolicy {
         }
     }
 
+    /// Policy built from declarative priority tables (PLAN 5.1.3).
+    ///
+    /// `origin_priorities` replaces the implicit origin order for the origins it
+    /// names (the rest keep [`crate::weaver::OriginPriority::new`]'s values);
+    /// `provider_overrides` is keyed by `origin/package` label and wins over any
+    /// origin entry. This is the constructor used by
+    /// [`crate::anchors_map::AnchorsMap::policy`], which feeds the parsed
+    /// `anchors.nix` map into bidding.
+    pub fn from_declarations(
+        origin_priorities: &BTreeMap<String, u32>,
+        provider_overrides: &BTreeMap<String, u32>,
+    ) -> Self {
+        let mut origins = OriginPriority::new();
+        for (origin, priority) in origin_priorities {
+            origins.set(origin, *priority);
+        }
+        Self {
+            origins,
+            overrides: provider_overrides.clone(),
+        }
+    }
+
     /// Declare a priority for one provider label (`origin/name`); lower wins.
     pub fn declare(&mut self, provider: impl Into<String>, priority: u32) -> &mut Self {
         self.overrides.insert(provider.into(), priority);
@@ -203,6 +243,10 @@ impl AnchorPolicy {
     }
 
     /// Apply this policy to `bids`, rewriting every bid's priority.
+    ///
+    /// Idempotent: applying the same policy twice yields the same priorities.
+    /// [`AnchorTable`] applies the policy it is handed, so calling this first is
+    /// optional (the weaver does it to inspect the rewritten bids).
     pub fn apply(&self, bids: &mut [AnchorBid]) {
         for bid in bids.iter_mut() {
             bid.priority = self.priority_of(&bid.provider);
@@ -261,17 +305,25 @@ impl AnchorTable {
 
     /// Bid for a set of SONAMEs and keep the winners.
     ///
-    /// Priorities are taken from each bid's `priority` field; use
-    /// [`AnchorPolicy::apply`] first to derive them from a policy. This never
-    /// fails: ties are broken by the documented total order, and a SONAME with
-    /// a single bid is simply anchored to it.
-    pub fn from_bids(bids: &[AnchorBid], _policy: &AnchorPolicy) -> Self {
-        let mut grouped: BTreeMap<&str, Vec<AnchorBid>> = BTreeMap::new();
-        for bid in bids {
+    /// `policy` is applied to every bid before ranking (PLAN 5.1.3): the
+    /// effective priority is always `policy.priority_of(provider)` —
+    /// per-provider override, then origin priority, then
+    /// [`DEFAULT_PRIORITY`] — so this constructor cannot rank against the
+    /// policy the caller passed. Passing bids that [`AnchorPolicy::apply`] has
+    /// already rewritten is fine and idempotent.
+    ///
+    /// This never fails: ties are broken by the documented total order, and a
+    /// SONAME with a single bid is simply anchored to it.
+    pub fn from_bids(bids: &[AnchorBid], policy: &AnchorPolicy) -> Self {
+        let mut ranked: Vec<AnchorBid> = bids.to_vec();
+        policy.apply(&mut ranked);
+
+        let mut grouped: BTreeMap<String, Vec<AnchorBid>> = BTreeMap::new();
+        for bid in ranked {
             if bid.soname.trim().is_empty() || bid.provider.trim().is_empty() {
                 continue;
             }
-            grouped.entry(bid.soname.as_str()).or_default().push(bid.clone());
+            grouped.entry(bid.soname.clone()).or_default().push(bid);
         }
 
         let mut choices = BTreeMap::new();
@@ -279,9 +331,9 @@ impl AnchorTable {
             sort_bids(&mut bids);
             let winner = bids[0].clone();
             choices.insert(
-                soname.to_string(),
+                soname.clone(),
                 AnchorChoice {
-                    soname: soname.to_string(),
+                    soname,
                     winner: winner.provider.clone(),
                     priority: winner.priority,
                     path: winner.path.clone(),
@@ -294,13 +346,17 @@ impl AnchorTable {
 
     /// Resolve one SONAME against `bids`; a missing provider is a typed error.
     ///
+    /// Like [`AnchorTable::from_bids`], the supplied `policy` is applied to every
+    /// bid before ranking (PLAN 5.1.3), so the returned
+    /// [`AnchorChoice::priority`] is the policy's value for the winner.
+    ///
     /// `Err(ExtosError::DependencyUnresolvable)` is returned when no bid carries
     /// `soname`, so a caller that *requires* the anchor never silently proceeds
     /// with an unanchored library.
     pub fn resolve(
         soname: &str,
         bids: &[AnchorBid],
-        _policy: &AnchorPolicy,
+        policy: &AnchorPolicy,
     ) -> Result<AnchorChoice, ExtosError> {
         let mut matching: Vec<AnchorBid> = bids
             .iter()
@@ -312,6 +368,7 @@ impl AnchorTable {
                 "anchor: no provider bids for SONAME {soname}"
             )));
         }
+        policy.apply(&mut matching);
         sort_bids(&mut matching);
         let winner = matching[0].clone();
         Ok(AnchorChoice {
@@ -503,13 +560,15 @@ mod tests {
 
     #[test]
     fn priority_ties_break_by_origin_then_version() {
-        // Same priority, different origins: lexicographic origin wins.
+        // Same (default) priority, different origins: lexicographic origin wins.
+        // Both origins are unknown to OriginPriority, so the policy assigns both
+        // DEFAULT_PRIORITY and the origin tiebreak is what decides.
         let bids = vec![
-            bid("libz.so.1", "debian/zlib", "1.3", 50),
-            bid("libz.so.1", "alpine/zlib", "1.3", 50),
+            bid("libz.so.1", "void/zlib", "1.3", 50),
+            bid("libz.so.1", "nixos/zlib", "1.3", 50),
         ];
         let table = AnchorTable::from_bids(&bids, &AnchorPolicy::new());
-        assert_eq!(table.winner_of("libz.so.1"), Some("alpine/zlib"));
+        assert_eq!(table.winner_of("libz.so.1"), Some("nixos/zlib"));
 
         // Same origin: the higher version wins, numerically (1.10 > 1.9).
         let bids = vec![
@@ -518,6 +577,39 @@ mod tests {
         ];
         let table = AnchorTable::from_bids(&bids, &AnchorPolicy::new());
         assert_eq!(table.get("libz.so.1").unwrap().bids[0].version, "1.10");
+    }
+
+    #[test]
+    fn policy_is_authoritative_over_bid_priority_fields() {
+        // G-L13 regression (PLAN 5.1.3): the policy argument is applied, so a
+        // bid whose `priority` field disagrees with the policy cannot override
+        // the policy's ranking.
+        let bids = vec![
+            bid("libc.so.6", "archlinux/glibc", "2.39", 99),
+            bid("libc.so.6", "debian/glibc", "2.39", 1),
+        ];
+        let table = AnchorTable::from_bids(&bids, &AnchorPolicy::new());
+        // OriginPriority: archlinux 10 < debian 20, regardless of the fields.
+        assert_eq!(table.winner_of("libc.so.6"), Some("archlinux/glibc"));
+        assert_eq!(table.get("libc.so.6").unwrap().priority, 10);
+
+        let choice = AnchorTable::resolve("libc.so.6", &bids, &AnchorPolicy::new()).unwrap();
+        assert_eq!(choice.winner, "archlinux/glibc");
+        assert_eq!(choice.priority, 10);
+
+        // from_declarations feeds both tables: declared origins and per-provider
+        // overrides, with the provider override winning.
+        let origins = BTreeMap::from([("debian".to_string(), 1)]);
+        let overrides = BTreeMap::from([("archlinux/glibc".to_string(), 7)]);
+        let policy = AnchorPolicy::from_declarations(&origins, &overrides);
+        assert_eq!(policy.priority_of("debian/other"), 1);
+        assert_eq!(policy.priority_of("archlinux/glibc"), 7);
+        assert_eq!(policy.priority_of("alpine/other"), 30);
+        assert_eq!(policy.priority_of("unknown/other"), DEFAULT_PRIORITY);
+        assert_eq!(
+            AnchorTable::from_bids(&bids, &policy).winner_of("libc.so.6"),
+            Some("debian/glibc")
+        );
     }
 
     #[test]
