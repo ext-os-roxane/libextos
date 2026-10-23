@@ -65,7 +65,7 @@ fn collect_so_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Validates that:
 /// 1. The required symbols (`rosetta_origin_name`, `rosetta_api_version`,
 ///    `rosetta_capabilities`) are present
-/// 2. The API version matches [`ROSETTA_API_VERSION`]
+/// 2. The API version matches [`ROSETTA_API_VERSION`](crate::rosetta::ROSETTA_API_VERSION)
 /// 3. Optional symbols are loaded based on capability flags
 ///
 /// # Safety

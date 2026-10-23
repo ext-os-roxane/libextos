@@ -46,6 +46,11 @@ pub struct PackageManifest {
     /// that predate the field deserialize to an empty map.
     #[serde(default)]
     pub phantom_spoofs: BTreeMap<SpoofTarget, Vec<SpoofEntry>>,
+    /// Tier-4 container profile declared by `containerPermissions`
+    /// (PLAN 4.4.1). `None` means "this package is not containerised"; older
+    /// manifests that predate the field deserialize to `None`.
+    #[serde(default)]
+    pub container: Option<ContainerPermissions>,
 }
 
 /// A foreign package-manager database that a package can spoof rows into.
@@ -206,6 +211,484 @@ pub struct SecurityBlock {
     pub mac_profile: Option<String>,
 }
 
+// ─── Container permissions (PLAN 4.4.1) ─────────────────────────
+
+/// One of the five Tier-4 isolation levels (PLAN 4.4, `design/ARCHITECTURE.md`
+/// §5).
+///
+/// | Level | Name | Network | IPC | Display |
+/// |-------|------|---------|-----|---------|
+/// | 0 | [`Isolated`](IsolationLevel::Isolated) | ✗ | ✗ | ✗ |
+/// | 1 | [`Cli`](IsolationLevel::Cli) | ✗ | ✗ | PTY |
+/// | 2 | [`Gui`](IsolationLevel::Gui) | ✗ | proxy sockets | Wayland + PipeWire |
+/// | 3 | [`Networked`](IsolationLevel::Networked) | host | proxy sockets | Wayland + PipeWire |
+/// | 4 | [`Privileged`](IsolationLevel::Privileged) | host | host | host |
+///
+/// The level is *declared* by a package manifest (`containerPermissions.level`)
+/// but never trusted blindly: the launcher re-checks it against the selected
+/// backend and refuses combinations the backend cannot honour with a typed
+/// error (see `container::backend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IsolationLevel {
+    /// Level 0: fresh user/mount/pid/ipc/uts/net namespaces, tmpfs root.
+    Isolated,
+    /// Level 1: Level 0 plus a controlling PTY.
+    Cli,
+    /// Level 2: Level 1 plus Wayland/PipeWire/D-Bus proxy socket bind-mounts.
+    Gui,
+    /// Level 3: Level 2 but the network namespace is inherited from the host.
+    Networked,
+    /// Level 4: no namespace restriction — build tools, Android, system agents.
+    Privileged,
+}
+
+impl IsolationLevel {
+    /// All levels, ascending.
+    pub const ALL: [IsolationLevel; 5] = [
+        IsolationLevel::Isolated,
+        IsolationLevel::Cli,
+        IsolationLevel::Gui,
+        IsolationLevel::Networked,
+        IsolationLevel::Privileged,
+    ];
+
+    /// Numeric level (`0..=4`).
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            IsolationLevel::Isolated => 0,
+            IsolationLevel::Cli => 1,
+            IsolationLevel::Gui => 2,
+            IsolationLevel::Networked => 3,
+            IsolationLevel::Privileged => 4,
+        }
+    }
+
+    /// Inverse of [`IsolationLevel::as_u8`].
+    pub fn from_u8(level: u8) -> Option<Self> {
+        IsolationLevel::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_u8() == level)
+    }
+
+    /// Canonical lower-case name (`"isolated"`, `"cli"`, …).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IsolationLevel::Isolated => "isolated",
+            IsolationLevel::Cli => "cli",
+            IsolationLevel::Gui => "gui",
+            IsolationLevel::Networked => "networked",
+            IsolationLevel::Privileged => "privileged",
+        }
+    }
+
+    /// Whether this level needs a controlling PTY (levels ≥ 1).
+    pub fn needs_pty(&self) -> bool {
+        *self != IsolationLevel::Isolated
+    }
+
+    /// Whether the network namespace is inherited from the host.
+    pub fn shares_host_network(&self) -> bool {
+        matches!(
+            self,
+            IsolationLevel::Networked | IsolationLevel::Privileged
+        )
+    }
+
+    /// Whether graphical proxy sockets are part of the level's default profile.
+    pub fn has_display(&self) -> bool {
+        matches!(
+            self,
+            IsolationLevel::Gui | IsolationLevel::Networked | IsolationLevel::Privileged
+        )
+    }
+}
+
+impl fmt::Display for IsolationLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IsolationLevel {
+    type Err = ExtosError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.trim().to_ascii_lowercase();
+        if let Some(level) = normalized
+            .strip_prefix('l')
+            .and_then(|rest| rest.parse::<u8>().ok())
+            .and_then(IsolationLevel::from_u8)
+        {
+            return Ok(level);
+        }
+        if let Ok(level) = normalized.parse::<u8>() {
+            return IsolationLevel::from_u8(level).ok_or_else(|| spec_err(format!(
+                "container isolation level out of range: {level} (expected 0..=4)"
+            )));
+        }
+        IsolationLevel::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == normalized)
+            .ok_or_else(|| {
+                spec_err(format!(
+                    "unknown container isolation level: {s:?} (expected isolated|cli|gui|networked|privileged or 0..=4)"
+                ))
+            })
+    }
+}
+
+/// Namespace toggles a container profile asks for.
+///
+/// Defaults are derived from the [`IsolationLevel`]
+/// ([`NamespaceToggles::for_level`]); a manifest may override individual flags
+/// with a `namespaces = { net = false; … };` block. `cgroup` is off by default
+/// for every level: unprivileged hosts cannot mount a delegated cgroup v2 tree,
+/// so ExtOS leaves that to the backend (documented limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceToggles {
+    /// Fresh user namespace with the caller mapped to `root` inside.
+    pub user: bool,
+    /// Fresh mount namespace (private propagation).
+    pub mount: bool,
+    /// Fresh PID namespace (the container entrypoint becomes PID 1).
+    pub pid: bool,
+    /// Fresh SysV/POSIX IPC namespace.
+    pub ipc: bool,
+    /// Fresh UTS namespace (the container may set its own hostname).
+    pub uts: bool,
+    /// Fresh network namespace (`false` = inherit the host's).
+    pub net: bool,
+    /// Fresh cgroup namespace (off by default, see the type docs).
+    pub cgroup: bool,
+}
+
+impl NamespaceToggles {
+    /// Default toggles for `level`.
+    pub fn for_level(level: IsolationLevel) -> Self {
+        match level {
+            IsolationLevel::Isolated | IsolationLevel::Cli | IsolationLevel::Gui => Self {
+                user: true,
+                mount: true,
+                pid: true,
+                ipc: true,
+                uts: true,
+                net: true,
+                cgroup: false,
+            },
+            IsolationLevel::Networked => Self {
+                user: true,
+                mount: true,
+                pid: true,
+                ipc: true,
+                uts: true,
+                net: false,
+                cgroup: false,
+            },
+            IsolationLevel::Privileged => Self {
+                user: false,
+                mount: false,
+                pid: false,
+                ipc: false,
+                uts: false,
+                net: false,
+                cgroup: false,
+            },
+        }
+    }
+
+    /// Whether any namespace is unshared at all.
+    pub fn any(&self) -> bool {
+        self.user || self.mount || self.pid || self.ipc || self.uts || self.net || self.cgroup
+    }
+}
+
+impl Default for NamespaceToggles {
+    fn default() -> Self {
+        Self::for_level(IsolationLevel::Isolated)
+    }
+}
+
+/// A host resource a Tier-4 profile is allowed to reach through a bind-mounted
+/// socket (PLAN 4.4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerSocket {
+    /// `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` compositor socket.
+    Wayland,
+    /// `$XDG_RUNTIME_DIR/pipewire-0`.
+    Pipewire,
+    /// `$XDG_RUNTIME_DIR/pulse/native` (PulseAudio or the PipeWire pulse shim).
+    PulseAudio,
+    /// `$DBUS_SESSION_BUS_ADDRESS` (unix socket only).
+    DbusSession,
+    /// The system bus (`/run/dbus/system_bus_socket`), resolved at runtime.
+    DbusSystem,
+    /// `$DISPLAY` X11 socket — fallback only, never selected over Wayland.
+    X11,
+}
+
+impl ContainerSocket {
+    /// Canonical manifest spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContainerSocket::Wayland => "wayland",
+            ContainerSocket::Pipewire => "pipewire",
+            ContainerSocket::PulseAudio => "pulse-audio",
+            ContainerSocket::DbusSession => "dbus-session",
+            ContainerSocket::DbusSystem => "dbus-system",
+            ContainerSocket::X11 => "x11",
+        }
+    }
+
+    /// Default socket set for a level (empty for levels 0/1).
+    pub fn defaults_for_level(level: IsolationLevel) -> Vec<ContainerSocket> {
+        match level {
+            IsolationLevel::Isolated | IsolationLevel::Cli => Vec::new(),
+            IsolationLevel::Gui | IsolationLevel::Networked => vec![
+                ContainerSocket::Wayland,
+                ContainerSocket::Pipewire,
+                ContainerSocket::DbusSession,
+            ],
+            IsolationLevel::Privileged => vec![
+                ContainerSocket::Wayland,
+                ContainerSocket::Pipewire,
+                ContainerSocket::PulseAudio,
+                ContainerSocket::DbusSession,
+                ContainerSocket::DbusSystem,
+            ],
+        }
+    }
+}
+
+impl fmt::Display for ContainerSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ContainerSocket {
+    type Err = ExtosError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "wayland" => Ok(ContainerSocket::Wayland),
+            "pipewire" => Ok(ContainerSocket::Pipewire),
+            "pulse" | "pulseaudio" | "pulse-audio" => Ok(ContainerSocket::PulseAudio),
+            "dbus" | "dbus-session" => Ok(ContainerSocket::DbusSession),
+            "dbus-system" | "system-dbus" => Ok(ContainerSocket::DbusSystem),
+            "x11" | "xorg" => Ok(ContainerSocket::X11),
+            _ => Err(spec_err(format!("unknown container socket kind: {s:?}"))),
+        }
+    }
+}
+
+/// The parsed `containerPermissions` block of a manifest (PLAN 4.4.1).
+///
+/// Grammar (all keys optional except the level):
+///
+/// ```nix
+/// containerPermissions = {
+///   level = "gui";            # or "2" / "l2"; also accepted: bare string form
+///   sockets = [ "wayland" "pipewire" "dbus-session" ];   # overrides the level default
+///   namespaces = { net = false; pid = true; };            # overrides per flag
+///   command = [ "/usr/bin/app" "--flag" ];                # entrypoint hint (instanz run)
+/// };
+/// // shorthand equivalent to level = "isolated":
+/// containerPermissions = "isolated";
+/// ```
+///
+/// Parsing is strictly additive: a manifest without the block keeps
+/// `PackageManifest::container == None` and every Phase 1–3 code path unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerPermissions {
+    /// Declared isolation level.
+    pub level: IsolationLevel,
+    /// Sockets the profile may bind-mount. Empty for levels 0/1.
+    #[serde(default)]
+    pub sockets: Vec<ContainerSocket>,
+    /// Namespace toggles (level defaults + manifest overrides).
+    #[serde(default)]
+    pub namespaces: NamespaceToggles,
+    /// Entrypoint hint, absolute path inside the container rootfs plus args.
+    /// Empty means "the launcher must be told what to run".
+    #[serde(default)]
+    pub command: Vec<String>,
+}
+
+impl Default for ContainerPermissions {
+    fn default() -> Self {
+        Self::new(IsolationLevel::Isolated)
+    }
+}
+
+impl ContainerPermissions {
+    /// A profile with the level's default socket set and namespace toggles.
+    pub fn new(level: IsolationLevel) -> Self {
+        Self {
+            level,
+            sockets: ContainerSocket::defaults_for_level(level),
+            namespaces: NamespaceToggles::for_level(level),
+            command: Vec::new(),
+        }
+    }
+
+    /// Replace the socket set.
+    pub fn with_sockets(mut self, sockets: impl IntoIterator<Item = ContainerSocket>) -> Self {
+        self.sockets = sockets.into_iter().collect();
+        self
+    }
+
+    /// Replace the entrypoint hint.
+    pub fn with_command(mut self, command: impl IntoIterator<Item = String>) -> Self {
+        self.command = command.into_iter().collect();
+        self
+    }
+
+    /// Whether `socket` is in the profile.
+    pub fn allows(&self, socket: ContainerSocket) -> bool {
+        self.sockets.contains(&socket)
+    }
+
+    /// Parse a `containerPermissions` value.
+    ///
+    /// Returns `Ok(None)` when the manifest has no such block (the common case).
+    pub fn from_nix(val: &NixValue) -> Result<Option<Self>, ExtosError> {
+        let Some(root) = val.get_path("containerPermissions") else {
+            return Ok(None);
+        };
+
+        // Shorthand: `containerPermissions = "gui";`
+        if let Some(text) = root.as_str() {
+            let level: IsolationLevel = text.parse()?;
+            return Ok(Some(Self::new(level)));
+        }
+
+        let table = root.as_attrset().ok_or_else(|| {
+            spec_err("manifest field 'containerPermissions' must be an attribute set or a level string")
+        })?;
+
+        let level: IsolationLevel = match table.get("level") {
+            Some(value) => {
+                if let Some(text) = value.as_str() {
+                    text.parse()?
+                } else if let Some(number) = value.as_int() {
+                    u8::try_from(number)
+                        .ok()
+                        .and_then(IsolationLevel::from_u8)
+                        .ok_or_else(|| {
+                            spec_err(format!(
+                                "containerPermissions.level out of range: {number} (expected 0..=4)"
+                            ))
+                        })?
+                } else {
+                    return Err(spec_err(
+                        "containerPermissions.level must be a string or an integer",
+                    ));
+                }
+            }
+            None => {
+                return Err(spec_err(
+                    "containerPermissions is missing the required 'level' key",
+                ));
+            }
+        };
+
+        let sockets = match table.get("sockets") {
+            Some(value) => {
+                let list = value.as_list().ok_or_else(|| {
+                    spec_err("containerPermissions.sockets must be a list of socket names")
+                })?;
+                let mut out = Vec::with_capacity(list.len());
+                for item in list {
+                    let name = item.as_str().ok_or_else(|| {
+                        spec_err("containerPermissions.sockets entries must be strings")
+                    })?;
+                    let socket: ContainerSocket = name.parse()?;
+                    if !out.contains(&socket) {
+                        out.push(socket);
+                    }
+                }
+                out
+            }
+            None => ContainerSocket::defaults_for_level(level),
+        };
+
+        let mut namespaces = NamespaceToggles::for_level(level);
+        if let Some(value) = table.get("namespaces") {
+            let ns = value.as_attrset().ok_or_else(|| {
+                spec_err("containerPermissions.namespaces must be an attribute set")
+            })?;
+            for (key, flag) in ns {
+                let enabled = flag.as_bool().ok_or_else(|| {
+                    spec_err(format!(
+                        "containerPermissions.namespaces.{key} must be a boolean"
+                    ))
+                })?;
+                let slot = match key.as_str() {
+                    "user" => &mut namespaces.user,
+                    "mount" => &mut namespaces.mount,
+                    "pid" => &mut namespaces.pid,
+                    "ipc" => &mut namespaces.ipc,
+                    "uts" => &mut namespaces.uts,
+                    "net" | "network" => &mut namespaces.net,
+                    "cgroup" | "cgroups" => &mut namespaces.cgroup,
+                    other => {
+                        return Err(spec_err(format!(
+                            "containerPermissions.namespaces has unknown flag: {other}"
+                        )));
+                    }
+                };
+                *slot = enabled;
+            }
+        }
+        if level == IsolationLevel::Privileged && namespaces.any() {
+            return Err(spec_err(
+                "containerPermissions declares level \"privileged\" but asks for namespace isolation; \
+                 privileged profiles must not restrict namespaces",
+            ));
+        }
+
+        let command = match table.get("command") {
+            Some(value) => value
+                .as_list()
+                .ok_or_else(|| spec_err("containerPermissions.command must be a list"))?
+                .iter()
+                .map(|item| {
+                    item.as_str().map(str::to_string).ok_or_else(|| {
+                        spec_err("containerPermissions.command entries must be strings")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
+        if let Some(program) = command.first() {
+            if !program.starts_with('/') {
+                return Err(spec_err(format!(
+                    "containerPermissions.command must start with an absolute in-container path, got {program:?}"
+                )));
+            }
+        }
+
+        Ok(Some(ContainerPermissions {
+            level,
+            sockets,
+            namespaces,
+            command,
+        }))
+    }
+}
+
+/// Build a `ConfigParse` error attributed to the manifest grammar.
+fn spec_err(message: impl Into<String>) -> ExtosError {
+    ExtosError::ConfigParse {
+        path: "manifest.nix".into(),
+        line: 0,
+        message: message.into(),
+    }
+}
+
 // ─── Parsing from NixValue ──────────────────────────────────────
 
 impl PackageManifest {
@@ -227,6 +710,7 @@ impl PackageManifest {
         let suggests = parse_suggests(val)?;
         let capabilities = parse_capabilities(val)?;
         let phantom_spoofs = parse_phantom_spoofs(val)?;
+        let container = ContainerPermissions::from_nix(val)?;
         let archive = val
             .get_str("archive")
             .map(|s| s.parse::<crate::types::ArchiveFormat>())
@@ -247,6 +731,7 @@ impl PackageManifest {
             capabilities,
             security: None,
             phantom_spoofs,
+            container,
         })
     }
 

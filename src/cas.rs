@@ -331,8 +331,8 @@ impl CasRepository {
 
     /// Resolve a ref to its target object hash.
     ///
-    /// Uses bounded symlink resolution with a stack limit of [`MAX_SYMLINK_DEPTH`]
-    /// to detect cycles (ELOOP).
+    /// Uses bounded symlink resolution with a stack limit of
+    /// `MAX_SYMLINK_DEPTH` to detect cycles (ELOOP).
     pub fn resolve_ref(&self, origin: &str, pkg: &str, ver: &str) -> Result<String, ExtosError> {
         let ref_link = self.ref_path(origin, pkg, ver);
         if !ref_link.exists() && ref_link.symlink_metadata().is_err() {

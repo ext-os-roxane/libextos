@@ -5,13 +5,17 @@
 //! package extraction, ELF scanning, ingestion pipeline,
 //! Rosetta plugin engine, and the Symlink/Reflink Weaver engine.
 
+pub mod anchor;
+pub mod appdir;
 pub mod cas;
 pub mod config;
+pub mod container;
 pub mod dependency;
 pub mod elf_scan;
 pub mod error;
 pub mod extract;
 pub mod fetcher;
+pub mod forge;
 pub mod ingest;
 pub mod manifest;
 pub mod nix_eval;

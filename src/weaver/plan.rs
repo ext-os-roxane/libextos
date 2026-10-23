@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::anchor::{AnchorBid, AnchorPolicy, AnchorTable};
 use crate::cas::{hash_bytes, CasRepository, RefEntry};
 use crate::config;
 use crate::error::ExtosError;
@@ -167,6 +168,7 @@ pub struct VfsPlan {
     collisions: Vec<ResolvedCollision>,
     strategy: LinkStrategy,
     warnings: Vec<String>,
+    anchors: AnchorTable,
 }
 
 impl Default for VfsPlan {
@@ -176,6 +178,7 @@ impl Default for VfsPlan {
             collisions: Vec::new(),
             strategy: LinkStrategy::Symlink,
             warnings: Vec::new(),
+            anchors: AnchorTable::empty(),
         }
     }
 }
@@ -200,6 +203,14 @@ impl VfsPlan {
     /// Link strategy planned for regular files.
     pub fn strategy(&self) -> LinkStrategy {
         self.strategy
+    }
+
+    /// SONAME anchor decisions made while planning (PLAN 4.1.3).
+    ///
+    /// Every library capability of the planned packages has one entry; the
+    /// winner is the provider that owns that SONAME in the woven tree.
+    pub fn anchors(&self) -> &AnchorTable {
+        &self.anchors
     }
 
     /// Replace the file link strategy (consuming builder form).
@@ -368,6 +379,24 @@ pub fn plan_from_refs_with(
     strategy: LinkStrategy,
     priority: &OriginPriority,
 ) -> Result<VfsPlan, ExtosError> {
+    plan_from_refs_with_anchors(repo, refs, strategy, priority, &AnchorPolicy::new())
+}
+
+/// [`plan_from_refs_with`] plus explicit SONAME anchor priorities (PLAN 4.1.3).
+///
+/// Anchor bidding runs *after* the virtual FHS is known (so bids carry real
+/// library paths) and *before* collisions are resolved: when two packages ship
+/// the same library, the anchor decision wins over the origin priority map, and
+/// the conflict is recorded as the usual [`CollisionResolution::PriorityWin`]
+/// with an explanatory warning. A library deployed by only one package is
+/// anchored to that package without a collision.
+pub fn plan_from_refs_with_anchors(
+    repo: &CasRepository,
+    refs: &[CasRef],
+    strategy: LinkStrategy,
+    priority: &OriginPriority,
+    anchor_policy: &AnchorPolicy,
+) -> Result<VfsPlan, ExtosError> {
     if refs.is_empty() {
         return Ok(VfsPlan::default().with_strategy(strategy));
     }
@@ -421,6 +450,10 @@ pub fn plan_from_refs_with(
 
     let vfs = VirtualFhs::build(repo, &packages)?;
 
+    // PLAN 4.1.3: bid SONAMEs before resolving collisions so the anchor
+    // decision — not the generic origin order — picks the library provider.
+    let anchors = bid_anchors(&graph, &packages, &vfs, anchor_policy);
+
     // Collision protocol first: it decides which claims are suppressed.
     let mut collisions = Vec::new();
     let mut suppressed: HashSet<(String, PathBuf)> = HashSet::new();
@@ -432,6 +465,7 @@ pub fn plan_from_refs_with(
             &path,
             &claimants,
             priority,
+            &anchors,
             strategy,
         )?;
         warnings.extend(outcome.warnings);
@@ -490,7 +524,44 @@ pub fn plan_from_refs_with(
         collisions,
         strategy,
         warnings,
+        anchors,
     })
+}
+
+/// Build the SONAME anchor table for a set of resolved packages.
+///
+/// Bids come from each manifest's `capabilities.libraries`. When the virtual FHS
+/// knows the real library path, it is used; otherwise the conventional
+/// `usr/lib/<soname>` is assumed. Priorities are derived from `policy`.
+fn bid_anchors(
+    graph: &DepGraph,
+    packages: &[crate::weaver::resolve::ResolvedPackage],
+    vfs: &VirtualFhs,
+    policy: &AnchorPolicy,
+) -> AnchorTable {
+    let mut bids: Vec<AnchorBid> = Vec::new();
+    for pkg in packages {
+        let provider = format!("{}/{}", pkg.identity.origin, pkg.identity.name);
+        let Some(node) = graph.nodes.get(pkg.node_idx) else {
+            continue;
+        };
+        let mut package_bids = AnchorBid::from_capabilities(
+            &provider,
+            &pkg.identity.origin,
+            &pkg.identity.version,
+            &node.capabilities,
+        );
+        for bid in &mut package_bids {
+            if let Some(entry) = vfs.get(&format!("usr/lib/{}", bid.soname)) {
+                if entry.provider == provider {
+                    bid.path = entry.rel_path.clone();
+                }
+            }
+        }
+        bids.extend(package_bids);
+    }
+    policy.apply(&mut bids);
+    AnchorTable::from_bids(&bids, policy)
 }
 
 /// Group pairwise collision records into `path → ordered claimant labels`.
@@ -521,6 +592,7 @@ fn resolve_collision(
     path: &Path,
     claimants: &[String],
     priority: &OriginPriority,
+    anchors: &AnchorTable,
     strategy: LinkStrategy,
 ) -> Result<CollisionOutcome, ExtosError> {
     let mut warnings = Vec::new();
@@ -550,6 +622,51 @@ fn resolve_collision(
             extra_ops,
             warnings,
         });
+    }
+
+    // PLAN 4.1.3: a declared SONAME anchor outranks the generic origin order.
+    // Only applies when the anchored winner is actually one of the claimants —
+    // otherwise the bid set and the claim set disagree and Tier 2 decides.
+    if let Some(anchor) = anchors.for_library_path(path) {
+        if claimants.iter().any(|c| c == &anchor.winner) {
+            let winner = anchor.winner.clone();
+            let losers: Vec<String> = claimants
+                .iter()
+                .filter(|c| **c != winner)
+                .cloned()
+                .collect();
+            for claimant in claimants {
+                suppressed.push((claimant.clone(), path.to_path_buf()));
+            }
+            match payload_op(repo, hashes, &winner, path, strategy) {
+                Some(op) => extra_ops.push(PlanEntry {
+                    op,
+                    provider: winner.clone(),
+                }),
+                None => warnings.push(format!(
+                    "anchor at {} won by {winner}, but its payload is missing",
+                    path.display()
+                )),
+            }
+            warnings.push(format!(
+                "anchor at {} won by {winner} over {} (SONAME bid priority {})",
+                path.display(),
+                losers.join(", "),
+                anchor.priority
+            ));
+            return Ok(CollisionOutcome {
+                resolved: ResolvedCollision {
+                    path: path.to_path_buf(),
+                    resolution: CollisionResolution::PriorityWin {
+                        winner,
+                        loser: losers.join(", "),
+                    },
+                },
+                suppressed,
+                extra_ops,
+                warnings,
+            });
+        }
     }
 
     // Tier 2: origin priority.

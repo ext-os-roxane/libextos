@@ -224,6 +224,7 @@ mod tests {
                 resources: vec![],
             },
             security: None,
+            container: None,
             phantom_spoofs: Default::default(),
         }
     }
