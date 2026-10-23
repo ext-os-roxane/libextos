@@ -81,6 +81,9 @@ pub struct Rootfs {
     pub symlinks: usize,
     /// Tier-3 dispatch wrappers written.
     pub wrappers: usize,
+    /// Files that received their declared file capabilities (PLAN 6.1.2);
+    /// refusals land in [`Rootfs::warnings`] instead.
+    pub file_caps: usize,
     /// Non-fatal notes from the planner and the writer.
     pub warnings: Vec<String>,
 }
@@ -133,6 +136,7 @@ pub fn assemble_rootfs(request: &RootfsRequest<'_>) -> Result<Rootfs, ContainerE
         files: 0,
         symlinks: 0,
         wrappers: 0,
+        file_caps: 0,
         warnings: plan.warnings().to_vec(),
     };
 
@@ -269,6 +273,18 @@ fn write_plan(plan: &VfsPlan, stage: &Path, rootfs: &mut Rootfs) -> Result<(), C
                     ))
                 })?;
                 rootfs.wrappers += 1;
+            }
+            PlanOp::FileCaps { capabilities, .. } => {
+                // The scoped rootfs copies payloads, so capabilities are
+                // re-applied on the copy. A refusal (unprivileged assembly)
+                // is recorded, never fatal and never silent.
+                match crate::security::filecaps::apply_file_caps(&target, capabilities) {
+                    Ok(()) => rootfs.file_caps += 1,
+                    Err(err) => rootfs.warnings.push(format!(
+                        "file capabilities skipped for {}: {err}",
+                        rel.display()
+                    )),
+                }
             }
         }
     }

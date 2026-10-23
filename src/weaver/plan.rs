@@ -24,11 +24,11 @@ use crate::dependency::{
     resolve_capability, CapabilityCandidate, CapabilityRequest, CapabilitySource, DependencySpec,
 };
 use crate::error::ExtosError;
-use crate::manifest::{Capabilities, PackageIdentity, PackageManifest};
+use crate::manifest::{Capabilities, PackageIdentity, PackageManifest, SecurityBlock};
 use crate::weaver::collision::{CollisionResolution, OriginPriority, ResolvedCollision};
 use crate::weaver::dag::{DagNode, DepGraph};
 use crate::weaver::link::{link_hardlink, link_reflink, link_symlink, LinkStrategy};
-use crate::weaver::resolve::MultiPassResolver;
+use crate::weaver::resolve::{MultiPassResolver, ResolvedPackage};
 use crate::weaver::vfs::{Collision, FhsEntry, FhsEntryKind, VirtualFhs};
 use crate::weaver::wrapper::{
     provider_slug, render_wrapper, write_executable, WrapperAlternative, WrapperSpec,
@@ -135,6 +135,17 @@ pub enum PlanOp {
         /// Complete script contents.
         script: String,
     },
+    /// Re-apply declared file capabilities on a woven regular file
+    /// (PLAN 6.1.2). Emitted only for files the declaring provider uniquely
+    /// owns after collision/anchor resolution; a kernel refusal (no
+    /// `CAP_SETFCAP` in this namespace) becomes an honest journal skip,
+    /// never a hard error and never a silent pass.
+    FileCaps {
+        /// Path relative to the rootfs root.
+        rel_path: PathBuf,
+        /// `CAP_*` names granted on the file.
+        capabilities: Vec<String>,
+    },
 }
 
 impl PlanOp {
@@ -144,7 +155,8 @@ impl PlanOp {
             PlanOp::Directory { rel_path }
             | PlanOp::Symlink { rel_path, .. }
             | PlanOp::Link { rel_path, .. }
-            | PlanOp::Wrapper { rel_path, .. } => rel_path,
+            | PlanOp::Wrapper { rel_path, .. }
+            | PlanOp::FileCaps { rel_path, .. } => rel_path,
         }
     }
 }
@@ -318,6 +330,11 @@ pub enum JournalAction {
     WrapperWritten,
     /// Identical wrapper already present.
     WrapperReused,
+    /// Declared file capabilities applied (PLAN 6.1.2).
+    FileCapsApplied,
+    /// Declared file capabilities refused by the kernel — recorded with the
+    /// reason (PLAN 6.1.2); a re-run retries.
+    FileCapsSkipped(String),
 }
 
 /// One journal row.
@@ -348,6 +365,11 @@ pub struct PlanExecution {
     pub reused: usize,
     /// Files that fell back from reflink/hardlink to the next strategy.
     pub fallbacks: usize,
+    /// Files that received their declared file capabilities (PLAN 6.1.2).
+    pub file_caps_applied: usize,
+    /// Files whose declared capabilities the kernel refused (PLAN 6.1.2);
+    /// every refusal is journaled with its reason.
+    pub file_caps_skipped: usize,
 }
 
 // ─── Planning ───────────────────────────────────────────────────
@@ -612,6 +634,10 @@ pub fn plan_from_refs_with_anchors_and_index(
     // Alternatives and wrapper/redirect entries come after the main tree.
     entries.extend(extra_ops);
 
+    // PLAN 6.1.2: file-capability re-application closes the plan, after every
+    // file materialization (including Tier-3 alternatives) has been laid out.
+    entries.extend(plan_file_caps(repo, &packages, &entries, &mut warnings)?);
+
     Ok(VfsPlan {
         entries,
         collisions,
@@ -620,6 +646,83 @@ pub fn plan_from_refs_with_anchors_and_index(
         anchors,
         promoted,
     })
+}
+
+/// Emit [`PlanOp::FileCaps`] entries for every declared file-capability grant
+/// whose file survived into the final plan (PLAN 6.1.2).
+///
+/// The final `entries` are authoritative: a grant is emitted only when the
+/// declaring provider's [`PlanOp::Link`] op targets the declared path after
+/// collision and anchor resolution. Every other case (missing payload, foreign
+/// provider winning the path, Tier-3 wrapper escalation) is dropped with an
+/// explicit plan warning so nothing is silently ignored. Unknown `CAP_*`
+/// names fail plan construction with a typed error.
+fn plan_file_caps(
+    repo: &CasRepository,
+    packages: &[ResolvedPackage],
+    entries: &[PlanEntry],
+    warnings: &mut Vec<String>,
+) -> Result<Vec<PlanEntry>, ExtosError> {
+    let mut ops = Vec::new();
+    for pkg in packages {
+        let label = format!("{}/{}", pkg.identity.origin, pkg.identity.name);
+        let Some(security) = load_security_block(repo, &pkg.hash)? else {
+            continue;
+        };
+        // Sorted view of the declaration so plan order stays deterministic.
+        let declared: BTreeMap<&String, &Vec<String>> = security.capabilities.iter().collect();
+        for (rel, caps) in declared {
+            if caps.is_empty() {
+                continue;
+            }
+            let rel_path = PathBuf::from(rel);
+            let woven = entries
+                .iter()
+                .find(|e| e.op.rel_path() == rel_path && !matches!(e.op, PlanOp::Directory { .. }));
+            match woven {
+                None => warnings.push(format!(
+                    "file capability declared for {rel} but nothing weaves that path; skipped"
+                )),
+                Some(e) if e.provider != label => warnings.push(format!(
+                    "file capability declared for {rel} but it is provided by {}; skipped",
+                    e.provider
+                )),
+                Some(e) if !matches!(e.op, PlanOp::Link { .. }) => warnings.push(format!(
+                    "file capability declared for {rel} but it escalated to a {} in the final \
+                     tree; skipped",
+                    match &e.op {
+                        PlanOp::Wrapper { .. } => "wrapper",
+                        _ => "symlink",
+                    }
+                )),
+                Some(_) => {
+                    crate::security::filecaps::caps_mask(caps)
+                        .map_err(|err| ExtosError::Weave(err.to_string()))?;
+                    ops.push(PlanEntry {
+                        op: PlanOp::FileCaps {
+                            rel_path,
+                            capabilities: caps.clone(),
+                        },
+                        provider: label.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(ops)
+}
+
+/// Re-read a resolved package's manifest and return its security block, if it
+/// declares one (PLAN 6.1.2; `pub(crate)` so the roof-security pass in
+/// [`crate::security`] reuses the same loader).
+pub(crate) fn load_security_block(
+    repo: &CasRepository,
+    hash: &str,
+) -> Result<Option<SecurityBlock>, ExtosError> {
+    let manifest_nix = repo.read_manifest(hash)?;
+    let value = config::parse_nix(&manifest_nix)?;
+    let manifest = PackageManifest::from_nix(&value)?;
+    Ok(manifest.security)
 }
 
 /// Hard ceiling on capability-index expansion passes (PLAN 5.2.3).
@@ -1324,6 +1427,36 @@ pub fn execute_plan(
                         action: JournalAction::WrapperWritten,
                     });
                 }
+            }
+            PlanOp::FileCaps {
+                rel_path,
+                capabilities,
+            } => {
+                let dest = target_root.join(rel_path);
+                ensure_parent(&dest)?;
+                let action = match crate::security::filecaps::apply_file_caps(&dest, capabilities)
+                {
+                    Ok(()) => {
+                        result.file_caps_applied += 1;
+                        JournalAction::FileCapsApplied
+                    }
+                    Err(err) => {
+                        // Honest skip: the declaration survives, the kernel
+                        // refused (e.g. no CAP_SETFCAP on this host). A re-run
+                        // retries; nothing is silently dropped.
+                        tracing::warn!(
+                            "file capabilities skipped for {}: {err}",
+                            rel_path.display()
+                        );
+                        result.file_caps_skipped += 1;
+                        JournalAction::FileCapsSkipped(err.to_string())
+                    }
+                };
+                result.journal.push(JournalEntry {
+                    rel_path: rel_path.clone(),
+                    provider: entry.provider.clone(),
+                    action,
+                });
             }
         }
     }

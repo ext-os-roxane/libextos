@@ -205,9 +205,15 @@ pub struct SuggestGroup {
 /// Security declarations for the weaver to apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityBlock {
-    /// File capabilities: path → list of caps (e.g., `"bin/ping" → ["CAP_NET_RAW"]`)
+    /// File capabilities: payload-root-relative path → list of `CAP_*` names
+    /// (e.g. `"usr/bin/ping" → ["CAP_NET_RAW"]`). Paths are exactly as they
+    /// appear in the woven tree (the CAS payload layout, FHS-projected).
+    /// The CAS sanitizer strips setuid/setgid at ingestion (PLAN 6.1.1);
+    /// these grants are re-applied on the woven copy (PLAN 6.1.2).
     pub capabilities: HashMap<String, Vec<String>>,
-    /// MAC profile references (AppArmor/SELinux)
+    /// MAC profile references (AppArmor/SELinux). The value is the AppArmor
+    /// profile name to synthesize (PLAN 6.2.1) and tags the package's files
+    /// for SELinux labeling (PLAN 6.2.2).
     pub mac_profile: Option<String>,
 }
 
@@ -711,6 +717,7 @@ impl PackageManifest {
         let capabilities = parse_capabilities(val)?;
         let phantom_spoofs = parse_phantom_spoofs(val)?;
         let container = ContainerPermissions::from_nix(val)?;
+        let security = parse_security_block(val)?;
         let archive = val
             .get_str("archive")
             .map(|s| s.parse::<crate::types::ArchiveFormat>())
@@ -729,7 +736,7 @@ impl PackageManifest {
             suggests,
             build_requires,
             capabilities,
-            security: None,
+            security,
             phantom_spoofs,
             container,
         })
@@ -768,6 +775,69 @@ impl PackageManifest {
         }
         entries
     }
+}
+
+/// Parse the optional `security` block (PLAN 6.1.2 / 6.2).
+///
+/// ```nix
+/// security = {
+///   capabilities = {
+///     "usr/bin/ping" = [ "CAP_NET_RAW" ];
+///   };
+///   mac_profile = "net-tools";
+/// };
+/// ```
+///
+/// `security = null` and an absent block both parse to `None`; an empty
+/// attribute set parses to an empty [`SecurityBlock`]. Capability names are
+/// kept verbatim here and validated at plan-build time by
+/// [`crate::security::filecaps::caps_mask`] so the error can name the
+/// offending path context.
+fn parse_security_block(val: &NixValue) -> Result<Option<SecurityBlock>, ExtosError> {
+    let Some(root) = val.get_path("security") else {
+        return Ok(None);
+    };
+    if matches!(root, NixValue::Null) {
+        return Ok(None);
+    }
+    let table = root.as_attrset().ok_or_else(|| {
+        spec_err("manifest field 'security' must be an attribute set or null")
+    })?;
+
+    let mut capabilities = HashMap::new();
+    match table.get("capabilities") {
+        None | Some(NixValue::Null) => {}
+        Some(caps) => {
+            let cmap = caps.as_attrset().ok_or_else(|| {
+                spec_err("'security.capabilities' must be an attribute set of path → CAP_* list")
+            })?;
+            for (path, list) in cmap {
+                let names = list.as_list().ok_or_else(|| {
+                    spec_err(format!("'security.capabilities.\"{path}\"' must be a list"))
+                })?;
+                let mut parsed = Vec::with_capacity(names.len());
+                for name in names {
+                    let text = name.as_str().ok_or_else(|| {
+                        spec_err(format!(
+                            "'security.capabilities.\"{path}\"' must contain only strings"
+                        ))
+                    })?;
+                    parsed.push(text.to_string());
+                }
+                capabilities.insert(path.clone(), parsed);
+            }
+        }
+    }
+
+    let mac_profile = table
+        .get("mac_profile")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
+    Ok(Some(SecurityBlock {
+        capabilities,
+        mac_profile,
+    }))
 }
 
 fn parse_identity(val: &NixValue) -> Result<PackageIdentity, ExtosError> {
@@ -1244,6 +1314,82 @@ pub fn resolve_auto_spoofs(origin: &str, name: &str) -> Vec<(SpoofTarget, SpoofE
 mod tests {
     use super::*;
     use crate::config::parse_nix;
+
+    #[test]
+    fn test_parse_security_block_round_trip() {
+        let input = r#"{
+            name = "ping";
+            version = "2024.1";
+            origin = "archlinux";
+            format = "extracted-tree";
+            security = {
+                capabilities = {
+                    "usr/bin/ping" = [ "CAP_NET_RAW" ];
+                    "usr/bin/other" = [ "CAP_NET_RAW" "CAP_NET_ADMIN" ];
+                };
+                mac_profile = "net-tools";
+            };
+        }"#;
+        let nix = parse_nix(input).unwrap();
+        let m = PackageManifest::from_nix(&nix).unwrap();
+        let security = m.security.expect("security block parsed");
+        assert_eq!(
+            security.capabilities.get("usr/bin/ping").unwrap(),
+            &["CAP_NET_RAW".to_string()]
+        );
+        assert_eq!(
+            security.capabilities.get("usr/bin/other").unwrap(),
+            &["CAP_NET_RAW".to_string(), "CAP_NET_ADMIN".to_string()]
+        );
+        assert_eq!(security.mac_profile.as_deref(), Some("net-tools"));
+    }
+
+    #[test]
+    fn test_parse_security_block_absent_and_null_and_empty() {
+        let absent = parse_nix(r#"{ name = "x"; version = "1"; origin = "o"; }"#).unwrap();
+        assert!(PackageManifest::from_nix(&absent).unwrap().security.is_none());
+
+        let null = parse_nix(
+            r#"{ name = "x"; version = "1"; origin = "o"; security = null; }"#,
+        )
+        .unwrap();
+        assert!(PackageManifest::from_nix(&null).unwrap().security.is_none());
+
+        let empty = parse_nix(
+            r#"{ name = "x"; version = "1"; origin = "o"; security = {}; }"#,
+        )
+        .unwrap();
+        let block = PackageManifest::from_nix(&empty)
+            .unwrap()
+            .security
+            .expect("empty attrset parses to an empty block");
+        assert!(block.capabilities.is_empty());
+        assert!(block.mac_profile.is_none());
+    }
+
+    #[test]
+    fn test_parse_security_block_rejects_malformed() {
+        // capabilities must be an attrset of lists
+        let bad = parse_nix(
+            r#"{ name = "x"; version = "1"; origin = "o"; security = { capabilities = [ "CAP_NET_RAW" ]; }; }"#,
+        )
+        .unwrap();
+        assert!(PackageManifest::from_nix(&bad).is_err());
+
+        // entries must be lists of strings
+        let bad_entry = parse_nix(
+            r#"{ name = "x"; version = "1"; origin = "o"; security = { capabilities = { "usr/bin/p" = 5; }; }; }"#,
+        )
+        .unwrap();
+        assert!(PackageManifest::from_nix(&bad_entry).is_err());
+
+        // security must be an attrset, not a bare string
+        let bad_root = parse_nix(
+            r#"{ name = "x"; version = "1"; origin = "o"; security = "hardened"; }"#,
+        )
+        .unwrap();
+        assert!(PackageManifest::from_nix(&bad_root).is_err());
+    }
 
     #[test]
     fn test_parse_manifest_flat() {

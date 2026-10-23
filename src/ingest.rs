@@ -77,6 +77,9 @@ pub struct IngestResult {
     pub capabilities: Capabilities,
     /// Whether a Rosetta plugin was used for metadata translation
     pub rosetta_translated: bool,
+    /// setuid/setgid bits stripped from regular files during sanitization
+    /// (PLAN 6.1.1). Always `0` when the payload carried none.
+    pub sanitized_bits: usize,
 }
 
 /// Default origin namespace used when only the archive format is known.
@@ -237,6 +240,11 @@ fn pipeline_inner(
         _ => extract::extract_package(archive_path, pkg_staging)?,
     };
 
+    // Step 1b: CAS sanitizer (PLAN 6.1.1) — strip setuid/setgid from every
+    // regular file before the content tree is hashed and committed, so the
+    // stored object can never carry them.
+    let sanitized_bits = sanitize_permissions(&extracted.content_dir)?;
+
     // Step 2: Parse metadata → identity + manifest.nix (plugin PARSE or built-in)
     let (identity, manifest_nix, rosetta_translated) =
         build_identity_and_manifest(&extracted, origin, plugin.as_deref())?;
@@ -262,7 +270,47 @@ fn pipeline_inner(
         version: identity.version,
         capabilities,
         rosetta_translated,
+        sanitized_bits,
     })
+}
+
+/// Strip the setuid (`0o4000`) and setgid (`0o2000`) bits from every regular
+/// file under `content_dir`, returning how many files were changed
+/// (PLAN 6.1.1, the "CAS sanitizer" of `design/ARCHITECTURE.md`).
+///
+/// The CAS is the immutable substrate every roof is woven from; privilege
+/// bits must therefore never enter it. Directories keep their setgid bit
+/// (legitimate for shared drop-boxes); symlinks carry no modes and are
+/// skipped. Escalated privilege re-enters declaratively at weave time via
+/// file capabilities (PLAN 6.1.2, `security::filecaps`).
+pub fn sanitize_permissions(content_dir: &Path) -> Result<usize, ExtosError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut stripped = 0usize;
+    let mut stack = vec![content_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = entry.metadata()?; // stat the link target for files
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let mode = meta.permissions().mode();
+            if mode & 0o6000 != 0 {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode & !0o6000))?;
+                stripped += 1;
+            }
+        }
+    }
+    if stripped > 0 {
+        tracing::info!("CAS sanitizer stripped {stripped} setuid/setgid file(s)");
+    }
+    Ok(stripped)
 }
 
 /// Resolve package identity and a `manifest.nix` body for an extracted package.
@@ -1016,6 +1064,10 @@ pub fn ingest_native_package(
     let nix_val = crate::config::parse_nix(&manifest_nix)?;
     let manifest = crate::manifest::PackageManifest::from_nix(&nix_val)?;
 
+    // CAS sanitizer (PLAN 6.1.1) — same invariant as the generic pipeline:
+    // privilege bits never enter the CAS, whatever the transport.
+    let sanitized_bits = sanitize_permissions(&extracted.content_dir)?;
+
     let hash = repo.store_directory(&extracted.content_dir)?;
     repo.write_manifest(&hash, &manifest_nix)?;
 
@@ -1034,6 +1086,7 @@ pub fn ingest_native_package(
         version: version.clone(),
         capabilities,
         rosetta_translated: false, // native packages already have a manifest
+        sanitized_bits,
     };
 
     let _ = fs::remove_dir_all(&pkg_staging);

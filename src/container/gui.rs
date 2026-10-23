@@ -119,6 +119,10 @@ pub struct GuiSpec {
     pub env: BTreeMap<String, String>,
     /// Environment variables that must be dropped inside the container.
     pub unset: Vec<String>,
+    /// D-Bus proxy filter for the bound bus, when the isolation level calls
+    /// for one (PLAN 6.2.3). `None` for levels without a bus in scope and for
+    /// the unfiltered host bus of Level 4.
+    pub dbus_filter: Option<crate::container::dbus_filter::DBusFilterProfile>,
     /// Non-fatal notes (absent sockets, refused transports, X11 auth, …).
     pub warnings: Vec<String>,
 }

@@ -142,7 +142,11 @@ impl LaunchSpec {
             }
         }
         if !profile.sockets.is_empty() {
-            let gui = assemble_gui_spec(&profile.sockets, &GuiEnv::from_env());
+            let mut gui = assemble_gui_spec(&profile.sockets, &GuiEnv::from_env());
+            // PLAN 6.2.3: the D-Bus filter contract rides with the spec for
+            // levels with a proxied bus (None for 0/1 and unfiltered 4).
+            gui.dbus_filter =
+                crate::container::dbus_filter::filter_for_level(profile.level);
             spec.gui = Some(gui);
         }
         spec
@@ -745,5 +749,23 @@ mod tests {
         let spec = LaunchSpec::from_profile(&profile, "/tmp/root", None);
         assert!(spec.program.is_empty());
         assert_eq!(spec.sockets(), Vec::<ContainerSocket>::new());
+    }
+
+    #[test]
+    fn dbus_filter_follows_the_isolation_level() {
+        use crate::container::dbus_filter::filter_for_level;
+
+        // Level 2 with sockets: the default-deny session profile rides along.
+        let gui = ContainerPermissions::new(IsolationLevel::Gui);
+        let spec = LaunchSpec::from_profile(&gui, "/tmp/root", Some("/bin/sh".into()));
+        let filter = spec.gui.as_ref().and_then(|g| g.dbus_filter.clone());
+        assert_eq!(filter, filter_for_level(IsolationLevel::Gui));
+        assert!(filter.is_some(), "level 2 carries a D-Bus filter");
+
+        // Level 4 shares the host bus unfiltered: explicitly no filter.
+        let priv_ = ContainerPermissions::new(IsolationLevel::Privileged);
+        let spec = LaunchSpec::from_profile(&priv_, "/tmp/root", Some("/bin/sh".into()));
+        let filter = spec.gui.as_ref().and_then(|g| g.dbus_filter.clone());
+        assert!(filter.is_none(), "level 4 must not carry a filter");
     }
 }

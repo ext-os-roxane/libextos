@@ -12,6 +12,9 @@
 //!   `/run`, tmpfs root).
 //! * [`gui`] — Wayland / PipeWire / PulseAudio / D-Bus / X11 socket
 //!   bind-mounts for levels 2–4 (PLAN 4.4.4).
+//! * [`dbus_filter`] — D-Bus proxy filter profiles synthesized per isolation
+//!   level (PLAN 6.2.3): the default-deny enforcement contract a proxy (or
+//!   restricted bus) applies in front of the bound socket.
 //! * [`namespace`] — the child-side syscall program (unshare → uid/gid maps →
 //!   mounts → chroot → fork → exec) plus its async-signal-safety contract
 //!   (PLAN 4.4.2/4.4.5/4.4.6).
@@ -62,6 +65,7 @@
 //! ```
 
 pub mod backend;
+pub mod dbus_filter;
 pub mod gui;
 pub mod launcher;
 pub mod mounts;

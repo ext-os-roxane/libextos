@@ -23,6 +23,7 @@ pub mod manifest;
 pub mod nix_eval;
 pub mod phantom;
 pub mod rosetta;
+pub mod security;
 pub mod snapshot;
 pub mod types;
 pub mod vlock;
