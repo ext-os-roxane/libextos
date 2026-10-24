@@ -27,6 +27,17 @@ pub mod phantom;
 pub mod rosetta;
 pub mod security;
 pub mod snapshot;
+/// §15 control-socket group permissions shared by both control-plane
+/// servers (PLAN 8.1.5).
+pub mod socket;
+
+/// Generated protobuf types and tonic service stubs for the control plane
+/// (PLAN 8.1.1/8.1.2). Sources live in `proto/extos/*.proto`; the build
+/// script regenerates this module on every build.
+pub mod pb {
+    tonic::include_proto!("extos");
+}
+pub mod swarm;
 pub mod types;
 pub mod users;
 pub mod vlock;

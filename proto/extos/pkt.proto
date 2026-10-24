@@ -1,0 +1,322 @@
+// ExtOS control plane — `pkt` operations (PLAN 8.1.1).
+//
+// Every message below mirrors an existing local surface one-to-one; each doc
+// comment names the Rust struct it mirrors. The `PktService` is served over a
+// Unix domain socket by the `pkt` gRPC server (PLAN 8.1.3) and consumed by
+// unprivileged clients (Phase 9 GUI); the schemas are that wire contract.
+//
+// Error convention: see `extos/common.proto` — gRPC status codes are
+// transport-only; the domain error rides in each response's `error` field
+// (uniformly field 15) and an unset `error` means success.
+//
+// Field-number blocks: each RPC group reserves one contiguous block per
+// message (commented at the group header) so new RPCs can be added without
+// renumbering existing fields.
+
+syntax = "proto3";
+
+package extos.pkt;
+
+import "extos/common.proto";
+
+// ─── Sync — `pkt -S` (mirror download + ingest) ────────────────────────────
+//
+// Mirrors `pkt -S` → `ingest::download_from_mirror_to` followed by
+// `ingest_local_archive_with_rosetta` (both in `src/ingest.rs`).
+// Field numbers: request 1-4, response 1-9, error 15.
+
+// One mirror sync: fetch `origin/name` at `version` through the configured
+// mirrors (`EXTOS_MIRRORS_<ORIGIN>`, transport via `EXTOS_FETCHER_<ORIGIN>`)
+// and ingest it into the CAS.
+message SyncRequest {
+  // Origin namespace, e.g. `archlinux`. Mirrors the `[origin/]` half of the
+  // `pkt -S` spec after `parse_sync_spec` resolved it (a bare name would have
+  // become the default origin server-side).
+  string origin = 1;
+
+  // Package name.
+  string name = 2;
+
+  // Explicit version. `pkt -S` requires one because mirror index resolution
+  // does not exist yet; the server enforces the same rule.
+  string version = 3;
+
+  // Download only, do not ingest (pacman's `-w`); mirrors `SyncArgs::downloadonly`.
+  bool download_only = 4;
+}
+
+// One sync result: the download surface `pkt -S` prints (archive path and
+// byte count) plus a flat mirror of `ingest::IngestResult`. With
+// `download_only` set, only the download fields are meaningful.
+message SyncResponse {
+  // Where the fetched archive landed: `<repository>/cache/<origin>/<filename>`.
+  string archive_path = 1;
+
+  // Size of the fetched archive in bytes.
+  uint64 archive_bytes = 2;
+
+  // CAS object hash (algo-prefixed); mirrors `IngestResult::hash`.
+  string hash = 3;
+
+  // Origin namespace used for refs; mirrors `IngestResult::origin`.
+  string origin = 4;
+
+  // Package name; mirrors `IngestResult::name`.
+  string name = 5;
+
+  // Package version; mirrors `IngestResult::version`.
+  string version = 6;
+
+  // Auto-discovered capabilities; mirrors `IngestResult::capabilities`.
+  Capabilities capabilities = 7;
+
+  // Whether a Rosetta plugin translated the metadata; mirrors
+  // `IngestResult::rosetta_translated`.
+  bool rosetta_translated = 8;
+
+  // setuid/setgid bits stripped during sanitization (PLAN 6.1.1); mirrors
+  // `IngestResult::sanitized_bits` (Rust `usize`, widened to uint64).
+  uint64 sanitized_bits = 9;
+
+  // Domain error; unset = success (see file header).
+  extos.common.Error error = 15;
+}
+
+// Auto-discovered capabilities of an ingested package. Flat mirror of
+// `manifest::Capabilities`.
+message Capabilities {
+  // Executable binaries (e.g. `htop`).
+  repeated string binaries = 1;
+
+  // Shared library SONAMEs (e.g. `libssl.so.3`).
+  repeated string libraries = 2;
+
+  // Virtual capabilities (e.g. `system-monitor`).
+  repeated string virtual_caps = 3;
+
+  // Shared resources (e.g. `/usr/share/applications/htop.desktop`).
+  repeated string resources = 4;
+}
+
+// ─── Query — `pkt -Q` (ref table) ──────────────────────────────────────────
+//
+// Mirrors `pkt -Q --all-refs` → `cas::CasRepository::list_refs` joined with
+// `CasRepository::resolve_ref` (both in `src/cas.rs`).
+// Field numbers: request 1, response 1, error 15.
+
+// List every concrete ref in the repository.
+message QueryRequest {
+  // Optional origin filter; absent (proto3 explicit presence) = all origins.
+  // Distinct from the empty string, which is not a valid origin.
+  optional string origin = 1;
+}
+
+// One row per concrete version ref, sorted by (origin, name, version) — the
+// `list_refs()` order. `current` pseudo-refs are skipped by the CAS walk and
+// therefore never appear here.
+message QueryResponse {
+  // The ref table.
+  repeated RefEntry refs = 1;
+
+  // Domain error; unset = success (see file header).
+  extos.common.Error error = 15;
+}
+
+// One semantic ref row with its resolved object. Mirrors `cas::RefEntry`
+// (origin/name/version) extended with the hash `CasRepository::resolve_ref`
+// returns — the join `pkt -Q --all-refs` renders as `label → hash`.
+message RefEntry {
+  // Origin namespace (e.g. `archlinux`, `debian`, `scratch`).
+  string origin = 1;
+
+  // Package name as recorded upstream.
+  string name = 2;
+
+  // Concrete version (never `current`).
+  string version = 3;
+
+  // CAS object hash the ref resolves to. Absent = dangling ref (the
+  // `(dangling)` row of `pkt -Q --all-refs`).
+  optional string object_hash = 4;
+}
+
+// ─── Files — `pkt -F` (file database + SONAME capability query) ────────────
+//
+// The two `-F` arms have disjoint return shapes, so they are modelled as two
+// RPCs under one group:
+//   - `pkt -F <query>`  → `cas::CasRepository::search_files` (`src/cas.rs`);
+//   - `pkt -F --soname` → `caps::CapabilityIndex` (PLAN 5.2.4, `src/caps.rs`).
+// Field numbers: requests 1, responses 1-6, error 15.
+
+// Search the CAS file database for one file path or glob. Matching rules are
+// the `cas::matches_query` rules: a plain query is a case-sensitive substring
+// of the relative path, a leading `/` anchors at a path boundary, `*`/`?`
+// glob within a single segment.
+message FilesRequest {
+  // File path or glob to search for.
+  string path_query = 1;
+}
+
+// One hit per matching file, sorted by ref then path (the `search_files()`
+// order). Objects are visited once: the first ref in `list_refs()` order owns
+// a hit.
+message FilesResponse {
+  // The path hits.
+  repeated FileHit hits = 1;
+
+  // Domain error; unset = success (see file header).
+  extos.common.Error error = 15;
+}
+
+// One file-search result. Flat mirror of `cas::FileHit`.
+message FileHit {
+  // Ref whose object contains the matched file (the owning package); mirrors
+  // `cas::FileHit::_ref`. Spelled `ref_entry` so the generated Rust field is
+  // a plain identifier (prost would raw-escape `ref` to `r#ref`).
+  RefEntry ref_entry = 1;
+
+  // Matched path relative to the object's `content/` root, with a leading
+  // `/`; mirrors `cas::FileHit::path`.
+  string path = 2;
+}
+
+// Query the SONAME capability index for the providers of one SONAME. Mirrors
+// `pkt -F --soname` → `caps::CapabilityIndex::query` (PLAN 5.2.4).
+message SonameRequest {
+  // SONAME key (e.g. `libssl.so.3`). Validated server-side like
+  // `caps::validate_soname`; a malformed key is a CONFIG_PARSE domain error,
+  // not an empty provider list.
+  string soname = 1;
+}
+
+// Providers of the requested SONAME (best-first, the index ordering) plus the
+// population summary the CLI prints (`pkt -F --soname` reports the indexed
+// counts and skipped rows so a short list is never mistaken for a miss).
+message SonameResponse {
+  // Providers of the SONAME, best-first.
+  repeated SonameProvider providers = 1;
+
+  // Population summary, flattened from `caps::CapabilityIndexSummary`:
+  // concrete refs visited.
+  uint64 refs_scanned = 2;
+
+  // Refs that contributed at least one capability row.
+  uint64 packages_indexed = 3;
+
+  // Stored (SONAME, provider) rows.
+  uint64 entries = 4;
+
+  // Distinct capability keys in the index.
+  uint64 sonames_indexed = 5;
+
+  // Rows skipped during population, in discovery order (never silently
+  // lossy); rendered `ref_id: message` like `caps::CapabilityWarning`.
+  repeated string warnings = 6;
+
+  // Domain error; unset = success (see file header).
+  extos.common.Error error = 15;
+}
+
+// One package providing a set of capability keys. Flat mirror of
+// `caps::CapabilityProvider`.
+message SonameProvider {
+  // Origin namespace the ref lives in.
+  string origin = 1;
+
+  // Package name as recorded by the ref.
+  string name = 2;
+
+  // Human-readable package version (manifest `identity.version` when
+  // non-empty, ref version otherwise); mirrors `CapabilityProvider::version`.
+  string version = 3;
+
+  // Concrete ref version component; mirrors `CapabilityProvider::ref_version`.
+  string ref_version = 4;
+
+  // CAS object hash the ref resolves to; mirrors `CapabilityProvider::object`
+  // (a Rust `Option` — population always fills it, hand-built providers may
+  // not, so it stays explicitly optional).
+  optional string object_hash = 5;
+
+  // Capability keys this provider declares, in manifest order.
+  repeated string provides = 6;
+}
+
+// ─── Ingest — `pkt -U` (local archive) ─────────────────────────────────────
+//
+// Mirrors `pkt -U` → `ingest::ingest_local_archive` (origin auto-detect) or
+// `ingest_local_archive_with_rosetta` (explicit origin), both in
+// `src/ingest.rs`.
+// Field numbers: request 1-3, response 1-7, error 15.
+
+// Ingest a local package archive from the daemon host. Native
+// `.pkt.tar.xz` archives always delegate to `ingest_native_package` (embedded
+// manifest is authoritative); every other format runs the standard
+// extract → parse → ELF scan → CAS commit pipeline.
+message IngestRequest {
+  // Path to a local archive (`.pkg.tar.zst`, `.pkg.tar.xz`, `.deb`, `.apk`
+  // or `.pkt.tar.xz`). Resolved on the daemon host, not the client.
+  string archive_path = 1;
+
+  // Explicit origin (`-o`); absent = auto-detect via
+  // `ingest::default_origin_for_archive`.
+  optional string origin = 2;
+
+  // Dispatch metadata parsing through the Rosetta registry. `pkt -U` always
+  // passes its discovered registry; false selects the built-in parser only.
+  bool rosetta = 3;
+}
+
+// One ingestion result. Flat mirror of `ingest::IngestResult`.
+message IngestResponse {
+  // CAS object hash (algo-prefixed); mirrors `IngestResult::hash`.
+  string hash = 1;
+
+  // Origin namespace used for refs; mirrors `IngestResult::origin`.
+  string origin = 2;
+
+  // Package name; mirrors `IngestResult::name`.
+  string name = 3;
+
+  // Package version; mirrors `IngestResult::version`.
+  string version = 4;
+
+  // Auto-discovered capabilities; mirrors `IngestResult::capabilities`.
+  Capabilities capabilities = 5;
+
+  // Whether a Rosetta plugin translated the metadata; mirrors
+  // `IngestResult::rosetta_translated`.
+  bool rosetta_translated = 6;
+
+  // setuid/setgid bits stripped during sanitization (PLAN 6.1.1); mirrors
+  // `IngestResult::sanitized_bits` (Rust `usize`, widened to uint64).
+  uint64 sanitized_bits = 7;
+
+  // Domain error; unset = success (see file header).
+  extos.common.Error error = 15;
+}
+
+// The `pkt` control-plane service (PLAN 8.1.1; served by PLAN 8.1.3).
+//
+// Served over the `pkt` control socket (ARCHITECTURE §15: `/run/extos/pkt.sock`,
+// overridable via `EXTOS_*` env; never a hardcoded path in tests). Every RPC
+// is unary and blocks until the operation completes: sync downloads can take
+// minutes (mirroring `pkt -S`) and ingest extracts a full archive. Streaming
+// or job-based modelling is deferred until a caller needs progress events.
+service PktService {
+  // Fetch `origin/name` at `version` via the configured mirrors and ingest it
+  // (`pkt -S`).
+  rpc Sync(SyncRequest) returns (SyncResponse);
+
+  // List the ref table, optionally filtered by origin (`pkt -Q --all-refs`).
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Search the CAS file database for a file path (`pkt -F <query>`).
+  rpc Files(FilesRequest) returns (FilesResponse);
+
+  // Query the SONAME capability index for providers (`pkt -F --soname`).
+  rpc Soname(SonameRequest) returns (SonameResponse);
+
+  // Ingest a local package archive (`pkt -U`).
+  rpc Ingest(IngestRequest) returns (IngestResponse);
+}

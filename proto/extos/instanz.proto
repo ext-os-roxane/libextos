@@ -1,0 +1,267 @@
+// ExtOS control plane — `instanz` operations (PLAN 8.1.2).
+//
+// Every message below mirrors an existing local surface one-to-one; each doc
+// comment names the Rust struct it mirrors. The `InstanzService` is served
+// over a Unix domain socket by the `instanz` gRPC server (PLAN 8.1.4) and
+// consumed by unprivileged clients (Phase 9 GUI); the schemas are that wire
+// contract.
+//
+// Error convention: see `extos/common.proto` — gRPC status codes are
+// transport-only; the domain error rides in each response's `error` field
+// (uniformly field 15) and an unset `error` means success.
+//
+// Long-running operations: apply/rollback/each container launch mutate the
+// system and take unbounded time, exactly like their `instanz` CLI
+// counterparts. Every RPC is therefore modelled as a blocking unary call that
+// returns an *operation summary* (generation number, root path, counts) once
+// the operation finished; streaming/progress modelling is deferred until a
+// caller needs it.
+//
+// Path-scoped knobs (generations root, boot root, forge scratch, `/var` and
+// `/home` mounts — the fields of `orchestrate::ApplyOptions`) are server
+// configuration resolved from the `EXTOS_*` environment exactly like the CLI;
+// they are deliberately not per-RPC arguments.
+
+syntax = "proto3";
+
+package extos.instanz;
+
+import "extos/common.proto";
+
+// ─── Apply — `instanz apply <system.nix>` ──────────────────────────────────
+//
+// Mirrors `instanz apply` → `orchestrate::apply` (`core/instanz/src/orchestrate.rs`).
+// Field numbers: request 1, response 1-14, error 15.
+
+// Apply one declarative system config. The server executes the same 11-step
+// pipeline as the CLI (expand → fetch → plan → snapshot → weave → /etc +
+// services → phantom → mounts → ldconfig → forge → lockfile/current switch).
+message ApplyRequest {
+  // Path to the declarative system config (`SystemConfig`) to apply,
+  // resolved on the daemon host.
+  string config_path = 1;
+}
+
+// What one successful apply produced. Flat mirror of
+// `orchestrate::ApplyReport`, with the security report flattened from
+// `libextos::security::RoofSecurityReport`.
+message ApplyResponse {
+  // Generation number that is now current; mirrors `ApplyReport::generation`.
+  uint64 generation = 1;
+
+  // Woven tree of that generation; mirrors `ApplyReport::root`.
+  string root = 2;
+
+  // Number of plan operations applied; mirrors `ApplyReport::plan_ops`.
+  uint64 plan_ops = 3;
+
+  // Phantom rows (canonical + spoofed) written; mirrors
+  // `ApplyReport::phantom_rows`.
+  uint64 phantom_rows = 4;
+
+  // Lockfile written into the generation; mirrors `ApplyReport::lockfile`.
+  string lockfile = 5;
+
+  // Forge phase token, as recorded: `forged` / `skipped` / `n/a`; mirrors
+  // `ApplyReport::forge`.
+  string forge = 6;
+
+  // BLS entries the forge wrote or confirmed (0 when it did not run);
+  // mirrors `ApplyReport::bls_entries`.
+  uint64 bls_entries = 7;
+
+  // Orphan generation directories the sweep removed; mirrors
+  // `ApplyReport::reaped`.
+  repeated uint64 reaped = 8;
+
+  // AppArmor profiles written under `<roof>/etc/apparmor.d/` (profile name =
+  // file name); mirrors `RoofSecurityReport::apparmor_profiles`.
+  repeated string apparmor_profiles = 9;
+
+  // Why a declared profile was not written (typed synthesis failures);
+  // mirrors `RoofSecurityReport::apparmor_skipped`.
+  repeated string apparmor_skipped = 10;
+
+  // SELinux contexts actually written by the kernel backend; mirrors
+  // `RoofSecurityReport::selinux_applied` (Rust `usize`, widened to uint64).
+  uint64 selinux_applied = 11;
+
+  // Packages skipped for SELinux labeling — one honest entry per package,
+  // not per file; mirrors `RoofSecurityReport::selinux_skipped`.
+  repeated string selinux_skipped = 12;
+
+  // Declared services enabled by this apply (PLAN 7.2.2); mirrors
+  // `ApplyReport::services_enabled`.
+  uint64 services_enabled = 13;
+
+  // Marker-recorded services no longer declared; mirrors
+  // `ApplyReport::services_disabled`.
+  uint64 services_disabled = 14;
+
+  // Domain error; unset = success (see file header).
+  extos.common.Error error = 15;
+}
+
+// ─── Rollback — `instanz rollback` ─────────────────────────────────────────
+//
+// Mirrors `instanz rollback` → `orchestrate::rollback` with
+// `orchestrate::RollbackTarget` (`core/instanz/src/orchestrate.rs`).
+// Field numbers: request oneof 1-2, response 1-2, error 15.
+
+// Which generation to activate. Flat mirror of `orchestrate::RollbackTarget`
+// (`Previous` / `Number(u64)`), typed as a oneof so a request can never ask
+// for both — the same invariant `RollbackTarget::parse` enforces on
+// `--generation`.
+message RollbackRequest {
+  oneof target {
+    // The newest generation older than the current one
+    // (`RollbackTarget::Previous`; CLI `--generation prev`/`previous`/absent).
+    PreviousGeneration previous = 1;
+
+    // An explicit generation number (`RollbackTarget::Number`).
+    uint64 number = 2;
+  }
+}
+
+// Marker for `RollbackRequest.target.previous`; carries no data — the target
+// is computed server-side, mirroring `RollbackTarget::Previous`.
+message PreviousGeneration {}
+
+// The generation now active. `orchestrate::rollback` returns the activated
+// generation number (u64); the response adds the generation root, derived
+// server-side from the configured generations root as `<rootfs>/gen-<n>`.
+message RollbackResponse {
+  // Generation number that is now current.
+  uint64 generation = 1;
+
+  // Generation root `<rootfs>/gen-<n>` of the activated generation.
+  string root = 2;
+
+  // Domain error; unset = success (see file header).
+  extos.common.Error error = 15;
+}
+
+// ─── Generations — `instanz generations` ───────────────────────────────────
+//
+// Mirrors `instanz generations` → `orchestrate::generations` +
+// `orchestrate::GenerationRow` (`core/instanz/src/orchestrate.rs`).
+// Field numbers: response 1, error 15.
+
+// List the generations under the configured generations root. The root is
+// server configuration (`--rootfs` / `EXTOS_ROOTFS`), so the request is empty.
+message GenerationsRequest {}
+
+// One row of `instanz generations`. Flat mirror of
+// `orchestrate::GenerationRow`.
+message GenerationRow {
+  // Generation number.
+  uint64 number = 1;
+
+  // Tracker timestamp (seconds since the epoch), if recorded; mirrors
+  // `GenerationRow::timestamp` (Rust `Option<u64>`).
+  optional uint64 timestamp = 2;
+
+  // Packages recorded in the generation's `.lock` file.
+  repeated string packages = 3;
+
+  // Tracker description (empty when none was recorded).
+  string description = 4;
+
+  // Whether `current` points here.
+  bool is_current = 5;
+
+  // Whether the generation is pinned against GC.
+  bool pinned = 6;
+}
+
+// The generation table, sorted by generation number (the `generations()`
+// order).
+message GenerationsResponse {
+  // One row per generation on disk.
+  repeated GenerationRow generations = 1;
+
+  // Domain error; unset = success (see file header).
+  extos.common.Error error = 15;
+}
+
+// ─── Container — `instanz run <profile>` ───────────────────────────────────
+//
+// Mirrors `instanz run` → `run::run` with `RunOptions`
+// (`core/instanz/src/run.rs`).
+// Field numbers: request 1-2, response 1-3, error 15.
+
+// Isolation level 0-4, mirroring `types::IsolationLevel` (its `GuiSandbox`
+// variant is spelled `GUI` here). `ISOLATION_LEVEL_ISOLATED = 0` doubles as
+// the proto3 default, which matches the CLI fallback chain: an unset level
+// means "manifest profile level, else isolated".
+enum IsolationLevel {
+  // Level 0: fully isolated (no network, no IPC, no host access).
+  ISOLATION_LEVEL_ISOLATED = 0;
+
+  // Level 1: CLI sandbox (PTY + CWD bind-mount).
+  ISOLATION_LEVEL_CLI = 1;
+
+  // Level 2: GUI sandbox (`types::IsolationLevel::GuiSandbox`).
+  ISOLATION_LEVEL_GUI = 2;
+
+  // Level 3: networked (GUI + host network or veth bridge).
+  ISOLATION_LEVEL_NETWORKED = 3;
+
+  // Level 4: privileged (host PID/net, explicit capabilities; requires the
+  // server's explicit opt-in, mirroring `RunOptions::allow_privileged`).
+  ISOLATION_LEVEL_PRIVILEGED = 4;
+}
+
+// Launch one container from an applied roof. The profile names a *system* or
+// a package profile; the entrypoint and the rest of the launch policy come
+// from the manifest/roof exactly as in `run.rs` — the RPC carries only what
+// the CLI flags carry.
+message ContainerRequest {
+  // System name or package profile name; mirrors `RunOptions::profile`.
+  string profile = 1;
+
+  // Isolation level override 0-4; absent = the manifest profile's level,
+  // else isolated. Mirrors `RunOptions::level` (`Option<u8>`) — explicit
+  // presence, because "override with level 0" and "no override" differ.
+  optional IsolationLevel level = 2;
+}
+
+// One container run summary. `run::run` blocks until the container exits and
+// returns its i32 exit code; the response adds the roof path and resolved
+// backend that the launcher prints.
+message ContainerResponse {
+  // Roof the container booted from (the `roof` line `run.rs` prints).
+  string roof = 1;
+
+  // Resolved backend (`native` / `nspawn` / `runc` / `crun` / `chroot`).
+  string backend = 2;
+
+  // Container exit code; mirrors `run::run`'s returned `i32` (negative for
+  // signal-killed containers), hence int32 rather than uint32.
+  int32 exit_code = 3;
+
+  // Domain error; unset = success (see file header).
+  extos.common.Error error = 15;
+}
+
+// The `instanz` control-plane service (PLAN 8.1.2; served by PLAN 8.1.4).
+//
+// Served over the `instanz` control socket (ARCHITECTURE §15:
+// `/run/extos/instanz.sock`, overridable via `EXTOS_*` env; never a hardcoded
+// path in tests). Every RPC is unary and blocks until the operation
+// completes, returning the operation summary documented on each response.
+service InstanzService {
+  // Apply a declarative system config (`instanz apply <config>`).
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+
+  // Switch `current` (and the BLS default) to an older generation
+  // (`instanz rollback`).
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+
+  // List the generations under the configured root (`instanz generations`).
+  rpc Generations(GenerationsRequest) returns (GenerationsResponse);
+
+  // Launch a container from an applied roof (`instanz run <profile>`); the
+  // RPC blocks until the container exits.
+  rpc Container(ContainerRequest) returns (ContainerResponse);
+}

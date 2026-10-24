@@ -1,9 +1,10 @@
-// libextos build script -- Phase 3 FFI link glue (PLAN sub-phases 3.1/3.2/3.4).
+// libextos build script -- Phase 3 FFI link glue (PLAN sub-phases 3.1/3.2/3.4)
+// plus Phase 8 protobuf codegen (PLAN sub-phases 8.1.1/8.1.2).
 //
-// Concurrency discipline: each Phase-3 lane may edit ONLY the region between
-// its own markers; regions stay semantically empty until populated. Empty
-// region == no contribution, which is legitimate for runtime-dlopen FFI
-// designs that need no compile-time linking at all.
+// Concurrency discipline: each lane may edit ONLY the region between its own
+// markers; regions stay semantically empty until populated. Empty region ==
+// no contribution, which is legitimate for runtime-dlopen FFI designs that
+// need no compile-time linking at all.
 fn main() {
     // === LANE31-BEGIN === (libexpr-extos / Nix evaluator link args)
     // === LANE31-END ===
@@ -17,4 +18,11 @@ fn main() {
     // `EXTOS_RPM_BRIDGE` (or LD_LIBRARY_PATH) at the resulting
     // `libextos-rpm-bridge.so`.
     // === LANE34-END ===
+    // === LANE-P8-BEGIN === (PLAN 8.1.1/8.1.2 protobuf codegen; lanes L29+ own
+    // the .proto sources — this region only runs the generator)
+    tonic_prost_build::configure()
+        .include_file("extos.rs")
+        .compile_protos(&["proto/extos/pkt.proto", "proto/extos/instanz.proto"], &["proto"])
+        .expect("protobuf codegen failed (PLAN 8.1.1/8.1.2)");
+    // === LANE-P8-END ===
 }

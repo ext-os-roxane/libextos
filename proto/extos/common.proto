@@ -1,0 +1,74 @@
+// ExtOS control plane — shared message types (PLAN 8.1.1 / 8.1.2).
+//
+// Imported by both `extos.pkt` and `extos.instanz`. Beyond the messages below,
+// this file pins the control-plane *error convention*:
+//
+// gRPC status codes are reserved for transport-level failures (socket not
+// listening, method unimplemented, malformed wire data). A *domain* failure —
+// the errors `ExtosError` (libextos) and `anyhow` (instanz orchestration)
+// produce locally — rides in the response's `error` field while gRPC reports
+// OK. To make that wrapper uniform, every response message in both packages
+// reserves field number 15 for an `extos.common.Error`; an unset `error`
+// field means success, and payload fields are best-effort on failure (the
+// server fills whatever it produced before failing).
+
+syntax = "proto3";
+
+package extos.common;
+
+// Domain error codes, mirroring `error::ExtosError`'s variants one-to-one
+// (same order, same meaning), plus `INTERNAL` for the `anyhow` domain errors
+// that instanz orchestration reports without an `ExtosError` variant.
+enum ErrorCode {
+  // Unspecified; servers must always set a specific code.
+  ERROR_CODE_UNSPECIFIED = 0;
+
+  // `ExtosError::Io` — I/O failure on the daemon host.
+  ERROR_CODE_IO = 1;
+
+  // `ExtosError::ConfigParse` — configuration/env parse failure.
+  ERROR_CODE_CONFIG_PARSE = 2;
+
+  // `ExtosError::CasIntegrity` — hash or size verification failure.
+  ERROR_CODE_CAS_INTEGRITY = 3;
+
+  // `ExtosError::PackageNotFound` — ref/package absent from the CAS.
+  ERROR_CODE_PACKAGE_NOT_FOUND = 4;
+
+  // `ExtosError::DependencyUnresolvable`.
+  ERROR_CODE_DEPENDENCY_UNRESOLVABLE = 5;
+
+  // `ExtosError::Collision` — two packages claim the same path.
+  ERROR_CODE_COLLISION = 6;
+
+  // `ExtosError::Weave`.
+  ERROR_CODE_WEAVE = 7;
+
+  // `ExtosError::Snapshot`.
+  ERROR_CODE_SNAPSHOT = 8;
+
+  // `ExtosError::Container`.
+  ERROR_CODE_CONTAINER = 9;
+
+  // `ExtosError::RosettaPlugin` — plugin load/parse failure.
+  ERROR_CODE_ROSETTA_PLUGIN = 10;
+
+  // `ExtosError::Serialization`.
+  ERROR_CODE_SERIALIZATION = 11;
+
+  // Domain failure without an `ExtosError` variant (instanz `anyhow` errors).
+  ERROR_CODE_INTERNAL = 12;
+}
+
+// One domain failure. Mirrors `error::ExtosError`: `code` names the variant
+// and `message` carries its `Display` rendering, including the variant's
+// payload fields (paths, expected/actual hashes, claimants, plugin names).
+// Structured payloads are deliberately not modelled: flat strings keep the
+// schema stable while the Rust error types evolve.
+message Error {
+  // Which `ExtosError`-class failure occurred.
+  ErrorCode code = 1;
+
+  // Human-readable rendering (the error's `Display` output).
+  string message = 2;
+}

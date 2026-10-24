@@ -76,6 +76,11 @@ pub struct SwarmConfig {
     pub listen: String,
     /// Bootstrap peer addresses, verbatim as declared; rendering sorts them.
     pub bootstrap: Vec<String>,
+    /// Serving-side bandwidth limit for swarm object transfer, bytes per
+    /// second (PLAN 8.2.3). `None` (the default) means unlimited; a value
+    /// must be > 0 — a zero limit would stall every transfer, so it is a
+    /// typed parse error instead.
+    pub max_bytes_per_second: Option<u64>,
 }
 
 /// Build a `ConfigParse` error attributed to the `swarm.nix` grammar.
@@ -127,10 +132,13 @@ pub fn parse_swarm_config(value: &NixValue) -> Result<SwarmConfig, ExtosError> {
         .ok_or_else(|| spec_err("'swarm' must be an attribute set"))?;
 
     for key in table.keys() {
-        if !matches!(key.as_str(), "enabled" | "listen" | "bootstrap") {
+        if !matches!(
+            key.as_str(),
+            "enabled" | "listen" | "bootstrap" | "max_bytes_per_second"
+        ) {
             return Err(spec_err(format!(
                 "'swarm' has unknown key: {key} \
-                 (expected 'enabled', 'listen', and/or 'bootstrap')"
+                 (expected 'enabled', 'listen', 'bootstrap', and/or 'max_bytes_per_second')"
             )));
         }
     }
@@ -167,10 +175,36 @@ pub fn parse_swarm_config(value: &NixValue) -> Result<SwarmConfig, ExtosError> {
         }
     }
 
+    let max_bytes_per_second = match table.get("max_bytes_per_second") {
+        Some(value) => {
+            let rate = value
+                .as_int()
+                .ok_or_else(|| spec_err("'swarm.max_bytes_per_second' must be an integer"))?;
+            if rate <= 0 {
+                return Err(spec_err(
+                    "'swarm.max_bytes_per_second' must be > 0 (use the key's absence for \
+                     unlimited)",
+                ));
+            }
+            u64::try_from(rate).map_err(|_| {
+                spec_err("'swarm.max_bytes_per_second' exceeds the u64 range")
+            })?
+        }
+        None => {
+            return Ok(SwarmConfig {
+                enabled,
+                listen,
+                bootstrap,
+                max_bytes_per_second: None,
+            })
+        }
+    };
+
     Ok(SwarmConfig {
         enabled,
         listen,
         bootstrap,
+        max_bytes_per_second: Some(max_bytes_per_second),
     })
 }
 
@@ -234,6 +268,11 @@ pub fn render_libp2p_settings(config: &SwarmConfig) -> String {
             .collect();
         out.push_str(&format!("bootstrap_peers = [ {} ]\n", quoted.join(", ")));
     }
+    // PLAN 8.2.3: emitted only when a limit is declared, so configurations
+    // without one render byte-identically to the Phase-7 output.
+    if let Some(rate) = config.max_bytes_per_second {
+        out.push_str(&format!("max_bytes_per_second = {rate}\n"));
+    }
     out
 }
 
@@ -243,6 +282,48 @@ pub fn render_libp2p_settings(config: &SwarmConfig) -> String {
 mod tests {
     use super::*;
     use crate::config::parse_nix;
+
+    #[test]
+    fn max_bytes_per_second_parses_and_defaults() {
+        let unlimited = parse_doc(
+            "swarm = { enabled = true; }",
+        );
+        assert_eq!(unlimited.max_bytes_per_second, None);
+
+        let limited = parse_doc(
+            r#"swarm = { enabled = true; max_bytes_per_second = 1048576; }"#,
+        );
+        assert_eq!(limited.max_bytes_per_second, Some(1048576));
+
+        // Rendered only when set — the Phase-7 byte pins must not move.
+        assert_eq!(
+            render_libp2p_settings(&unlimited),
+            render_libp2p_settings(&SwarmConfig {
+                enabled: true,
+                listen: DEFAULT_LISTEN_MULTIADDR.to_string(),
+                bootstrap: vec![],
+                max_bytes_per_second: None,
+            })
+        );
+        let rendered = render_libp2p_settings(&limited);
+        assert!(rendered.contains("max_bytes_per_second = 1048576\n"), "{rendered}");
+        assert!(rendered.ends_with("max_bytes_per_second = 1048576\n"));
+    }
+
+    #[test]
+    fn zero_or_negative_bandwidth_limits_are_typed_rejected() {
+        for bad in ["swarm = { max_bytes_per_second = 0; }", "swarm = { max_bytes_per_second = -5; }"] {
+            let doc = parse_nix(bad).unwrap();
+            let err = parse_swarm_config(&doc).unwrap_err();
+            assert!(
+                err.to_string().contains("max_bytes_per_second"),
+                "{bad}: {err}"
+            );
+        }
+        // Non-integer too.
+        let doc = parse_nix(r#"swarm = { max_bytes_per_second = "fast"; }"#).unwrap();
+        assert!(parse_swarm_config(&doc).is_err());
+    }
 
     fn parse_doc(text: &str) -> SwarmConfig {
         parse_swarm_config(&parse_nix(text).unwrap()).unwrap()
@@ -316,6 +397,7 @@ mod tests {
             enabled: false,
             listen: DEFAULT_LISTEN_MULTIADDR.to_string(),
             bootstrap: Vec::new(),
+            max_bytes_per_second: None,
         });
         assert_eq!(
             empty,
@@ -367,6 +449,7 @@ mod tests {
             enabled: false,
             listen: "/ip4/0.0.0.0/tcp/4001\nEnabled=false".to_string(),
             bootstrap: vec!["p2p://x\u{1}".to_string()],
+            max_bytes_per_second: None,
         };
         let toml = render_libp2p_settings(&hostile);
         assert_eq!(
@@ -381,6 +464,7 @@ mod tests {
             enabled: false,
             listen: "a\\b\"c".to_string(),
             bootstrap: Vec::new(),
+            max_bytes_per_second: None,
         });
         assert_eq!(
             escaped,
